@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "leadfair",
+  "compatibility_date": "2026-07-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": ".open-next/worker.js",
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "vars": {
+    "NEXTJS_ENV": "production"
+  }
+  // NOTE: DATABASE_URL must be added as a Secret:
+  //   npx wrangler secret put DATABASE_URL
+  // Cloudflare Workers cannot open raw TCP PostgreSQL sockets — use
+  // Cloudflare Hyperdrive (recommended) and point DATABASE_URL to it:
+  //   "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "<hyperdrive-id>" }]
+}

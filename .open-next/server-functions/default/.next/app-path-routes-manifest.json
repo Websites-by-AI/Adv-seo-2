@@ -1,0 +1,20 @@
+{
+  "/_global-error/page": "/_global-error",
+  "/_not-found/page": "/_not-found",
+  "/api/agencies/route": "/api/agencies",
+  "/api/bids/[token]/award/route": "/api/bids/[token]/award",
+  "/api/bids/[token]/route": "/api/bids/[token]",
+  "/api/bids/route": "/api/bids",
+  "/api/companies/[id]/pipeline/route": "/api/companies/[id]/pipeline",
+  "/api/companies/[id]/route": "/api/companies/[id]",
+  "/api/companies/route": "/api/companies",
+  "/api/health/route": "/api/health",
+  "/api/import/route": "/api/import",
+  "/api/logs/route": "/api/logs",
+  "/api/serp/route": "/api/serp",
+  "/bid/[token]/page": "/bid/[token]",
+  "/bids/page": "/bids",
+  "/compare/page": "/compare",
+  "/page": "/",
+  "/proposal/[id]/page": "/proposal/[id]"
+}

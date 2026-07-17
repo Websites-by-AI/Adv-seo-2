@@ -1,0 +1,166 @@
+{
+  "version": 3,
+  "pages404": true,
+  "appType": "app",
+  "caseSensitive": false,
+  "basePath": "",
+  "redirects": [
+    {
+      "source": "/:path+/",
+      "destination": "/:path+",
+      "internal": true,
+      "priority": true,
+      "statusCode": 308,
+      "regex": "^(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))/$"
+    }
+  ],
+  "headers": [],
+  "onMatchHeaders": [],
+  "rewrites": {
+    "beforeFiles": [],
+    "afterFiles": [],
+    "fallback": []
+  },
+  "dynamicRoutes": [
+    {
+      "page": "/api/bids/[token]",
+      "regex": "^/api/bids/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPtoken": "nxtPtoken"
+      },
+      "namedRegex": "^/api/bids/(?<nxtPtoken>[^/]+?)(?:/)?$"
+    },
+    {
+      "page": "/api/bids/[token]/award",
+      "regex": "^/api/bids/([^/]+?)/award(?:/)?$",
+      "routeKeys": {
+        "nxtPtoken": "nxtPtoken"
+      },
+      "namedRegex": "^/api/bids/(?<nxtPtoken>[^/]+?)/award(?:/)?$"
+    },
+    {
+      "page": "/api/companies/[id]",
+      "regex": "^/api/companies/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPid": "nxtPid"
+      },
+      "namedRegex": "^/api/companies/(?<nxtPid>[^/]+?)(?:/)?$"
+    },
+    {
+      "page": "/api/companies/[id]/pipeline",
+      "regex": "^/api/companies/([^/]+?)/pipeline(?:/)?$",
+      "routeKeys": {
+        "nxtPid": "nxtPid"
+      },
+      "namedRegex": "^/api/companies/(?<nxtPid>[^/]+?)/pipeline(?:/)?$"
+    },
+    {
+      "page": "/bid/[token]",
+      "regex": "^/bid/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPtoken": "nxtPtoken"
+      },
+      "namedRegex": "^/bid/(?<nxtPtoken>[^/]+?)(?:/)?$"
+    },
+    {
+      "page": "/proposal/[id]",
+      "regex": "^/proposal/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPid": "nxtPid"
+      },
+      "namedRegex": "^/proposal/(?<nxtPid>[^/]+?)(?:/)?$"
+    }
+  ],
+  "staticRoutes": [
+    {
+      "page": "/",
+      "regex": "^/(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/(?:/)?$"
+    },
+    {
+      "page": "/_global-error",
+      "regex": "^/_global\\-error(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/_global\\-error(?:/)?$"
+    },
+    {
+      "page": "/_not-found",
+      "regex": "^/_not\\-found(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/_not\\-found(?:/)?$"
+    },
+    {
+      "page": "/api/agencies",
+      "regex": "^/api/agencies(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/agencies(?:/)?$"
+    },
+    {
+      "page": "/api/bids",
+      "regex": "^/api/bids(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/bids(?:/)?$"
+    },
+    {
+      "page": "/api/companies",
+      "regex": "^/api/companies(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/companies(?:/)?$"
+    },
+    {
+      "page": "/api/health",
+      "regex": "^/api/health(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/health(?:/)?$"
+    },
+    {
+      "page": "/api/import",
+      "regex": "^/api/import(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/import(?:/)?$"
+    },
+    {
+      "page": "/api/logs",
+      "regex": "^/api/logs(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/logs(?:/)?$"
+    },
+    {
+      "page": "/api/serp",
+      "regex": "^/api/serp(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/serp(?:/)?$"
+    },
+    {
+      "page": "/bids",
+      "regex": "^/bids(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/bids(?:/)?$"
+    },
+    {
+      "page": "/compare",
+      "regex": "^/compare(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/compare(?:/)?$"
+    }
+  ],
+  "dataRoutes": [],
+  "rsc": {
+    "header": "rsc",
+    "varyHeader": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+    "prefetchHeader": "next-router-prefetch",
+    "didPostponeHeader": "x-nextjs-postponed",
+    "contentTypeHeader": "text/x-component",
+    "suffix": ".rsc",
+    "prefetchSegmentHeader": "next-router-segment-prefetch",
+    "prefetchSegmentSuffix": ".segment.rsc",
+    "prefetchSegmentDirSuffix": ".segments",
+    "clientParamParsing": false,
+    "dynamicRSCPrerender": false
+  },
+  "rewriteHeaders": {
+    "pathHeader": "x-nextjs-rewritten-path",
+    "queryHeader": "x-nextjs-rewritten-query"
+  }
+}

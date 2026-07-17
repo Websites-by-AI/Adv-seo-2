@@ -1,0 +1,20 @@
+{
+  "/_global-error/page": "app/_global-error/page.js",
+  "/_not-found/page": "app/_not-found/page.js",
+  "/api/agencies/route": "app/api/agencies/route.js",
+  "/api/bids/[token]/award/route": "app/api/bids/[token]/award/route.js",
+  "/api/bids/[token]/route": "app/api/bids/[token]/route.js",
+  "/api/bids/route": "app/api/bids/route.js",
+  "/api/companies/[id]/pipeline/route": "app/api/companies/[id]/pipeline/route.js",
+  "/api/companies/[id]/route": "app/api/companies/[id]/route.js",
+  "/api/companies/route": "app/api/companies/route.js",
+  "/api/health/route": "app/api/health/route.js",
+  "/api/import/route": "app/api/import/route.js",
+  "/api/logs/route": "app/api/logs/route.js",
+  "/api/serp/route": "app/api/serp/route.js",
+  "/bid/[token]/page": "app/bid/[token]/page.js",
+  "/bids/page": "app/bids/page.js",
+  "/compare/page": "app/compare/page.js",
+  "/page": "app/page.js",
+  "/proposal/[id]/page": "app/proposal/[id]/page.js"
+}
