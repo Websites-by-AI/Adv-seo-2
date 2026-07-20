@@ -1,0 +1,140 @@
+/* Device and safe-area hardening */
+html, body { max-width: 100%; overflow-x: hidden; }
+body { min-height: 100vh; min-height: 100dvh; }
+.app { min-height: 100vh; min-height: 100dvh; }
+.table-wrap, .proposal-sheet-wrap { -webkit-overflow-scrolling: touch; }
+.pdf-link-box { display: none; margin-top: 12px; padding: 12px; border: 1px solid #b8ddd8; background: #f3fcfb; border-radius: 13px; }
+.pdf-link-box.show { display: block; }
+.pdf-link-row { display: grid; grid-template-columns: 1fr auto auto; gap: 7px; align-items: center; }
+.pdf-link-box small { display: block; margin-top: 8px; color: var(--muted); font-size: 9px; line-height: 1.6; }
+
+/* Keep the full right-side menu on tablets and narrow desktop previews. */
+@media (min-width: 721px) and (max-width: 1080px) {
+  .app { grid-template-columns: 220px minmax(0, 1fr); }
+  .sidebar { padding: 20px 12px; overflow-y: auto; }
+  .brand { justify-content: flex-start; padding-right: 8px; }
+  .brand-copy, .nav-btn span:not(.nav-ico), .nav-label, .sidebar-foot { display: block; }
+  .nav-btn { justify-content: flex-start; padding: 10px 11px; }
+  .sidebar-foot { position: static; margin-top: 18px; }
+}
+
+@media (max-width: 720px) {
+  body { font-size: 13px; }
+  .sidebar {
+    width: min(86vw, 300px);
+    height: 100dvh;
+    padding-top: max(20px, env(safe-area-inset-top));
+    padding-bottom: max(18px, env(safe-area-inset-bottom));
+  }
+  .topbar {
+    min-height: 64px;
+    height: auto;
+    padding-top: max(8px, env(safe-area-inset-top));
+    padding-right: max(12px, env(safe-area-inset-right));
+    padding-left: max(12px, env(safe-area-inset-left));
+    gap: 8px;
+  }
+  .page-title { min-width: 0; }
+  .page-title h1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 58vw; }
+  .page-title p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 62vw; }
+  .content {
+    padding-right: max(12px, env(safe-area-inset-right));
+    padding-left: max(12px, env(safe-area-inset-left));
+    padding-bottom: max(38px, env(safe-area-inset-bottom));
+  }
+  .btn, .field, .select { min-height: 44px; }
+  input.field, select.select, textarea.textarea { font-size: 16px; }
+  .channel-strip, .integration-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .channel-card { min-height: 104px; }
+  .send-actions { display: grid; grid-template-columns: 1fr; }
+  .send-actions .btn { width: 100%; }
+  .pdf-link-row { grid-template-columns: 1fr 1fr; }
+  .pdf-link-row .field { grid-column: 1 / -1; min-width: 0; }
+  .proposal-sheet-wrap { padding: 6px; border-radius: 12px; }
+  .proposal-page { width: 100%; padding: 18px; box-shadow: none; }
+  .proposal-brand { align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .proposal-cover h2 { font-size: 20px; }
+  .proposal-section { margin-top: 18px; }
+  .drawer { width: 100vw; max-width: 100vw; padding-bottom: env(safe-area-inset-bottom); }
+  .drawer-head { padding-top: max(16px, env(safe-area-inset-top)); }
+  .modal-backdrop { padding: 8px; }
+  .modal { max-height: calc(100dvh - 16px); overflow: auto; }
+  .home-hero { border-radius: 20px; }
+  .home-cta > div:last-child { display: grid !important; grid-template-columns: 1fr; }
+}
+
+@media (max-width: 380px) {
+  .channel-strip, .integration-grid, .home-trust { grid-template-columns: 1fr; }
+  .kpi { padding: 14px; }
+  .home-hero { padding: 24px 17px; }
+  .home-hero h2 { font-size: 23px; }
+}
+
+/* Mobile app navigation */
+.mobile-bottom-nav { display: none; }
+
+@media (max-width: 720px) {
+  .mobile-bottom-nav {
+    position: fixed;
+    z-index: 55;
+    right: 10px;
+    left: 10px;
+    bottom: max(8px, env(safe-area-inset-bottom));
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    padding: 7px;
+    background: rgba(13,36,56,.96);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 18px;
+    box-shadow: 0 14px 38px rgba(8,24,37,.30);
+  }
+  .mobile-bottom-nav button {
+    min-height: 48px;
+    border: 0;
+    border-radius: 12px;
+    background: transparent;
+    color: #9db6c8;
+    display: grid;
+    place-items: center;
+    align-content: center;
+    gap: 2px;
+  }
+  .mobile-bottom-nav button.active { color: #fff; background: rgba(0,166,156,.22); }
+  .mobile-bottom-nav span { font-size: 17px; line-height: 1; }
+  .mobile-bottom-nav small { font-size: 9px; }
+  .content { padding-bottom: max(100px, calc(82px + env(safe-area-inset-bottom))); }
+
+  /* Easier channel selection on narrow devices */
+  .channel-strip {
+    display: flex;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    gap: 9px;
+    padding: 2px 2px 9px;
+    scrollbar-width: none;
+  }
+  .channel-strip::-webkit-scrollbar { display: none; }
+  .channel-card {
+    flex: 0 0 132px;
+    min-height: 94px;
+    scroll-snap-align: start;
+  }
+  .channel-logo { width: 31px; height: 31px; }
+
+  .card, .table-card, .send-builder, .send-preview, .campaign-queue,
+  .agency-list, .agency-editor, .partner-controls, .partner-results {
+    border-radius: 15px;
+  }
+  .section-card, .send-builder, .send-preview, .campaign-queue,
+  .agency-list, .agency-editor, .partner-controls, .partner-results { padding: 16px; }
+  .card-head { margin-bottom: 13px; }
+  .detail-row { grid-template-columns: 92px 1fr; }
+}
+
+@media (max-height: 520px) and (orientation: landscape) {
+  .sidebar { overflow-y: auto; }
+  .sidebar-foot { position: static; margin-top: 16px; }
+  .home-hero { min-height: auto; }
+  .mobile-bottom-nav { right: 18%; left: 18%; }
+}
