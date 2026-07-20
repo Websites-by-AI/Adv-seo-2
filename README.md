@@ -32,6 +32,33 @@ Open `http://127.0.0.1:8000`.
 
 Sending is safe by default: `DRY_RUN=true` and `SEND_ENABLED=false`. Every request also requires `consent=true` and `approved=true`.
 
+## Automatic connection to Adv-seo Next.js
+
+The connected Next.js package calls this Python API server-to-server. Configure the same generated Secret in both deployments:
+
+```text
+# This Python deployment
+CLINIC_SIGNAL_API_TOKEN=GENERATE_A_RANDOM_SECRET
+CLINIC_SIGNAL_REQUIRE_AUTH=false
+PUBLIC_BASE_URL=https://YOUR-PYTHON-PROJECT.vercel.app
+```
+
+Generate the value locally with `openssl rand -hex 32`; never commit it. With `CLINIC_SIGNAL_REQUIRE_AUTH=false`, the standalone Clinic Signal UI continues to work, while calls marked as internal by Next.js must still pass a valid Bearer token. Set it to `true` only when Next.js is the sole UI or a separate login protects this service. See `NEXTJS_CONNECTION.md` for exact deployment steps.
+
+## Automatic clinic search and opportunity database
+
+Link-only mode is expected when no approved search provider is configured. For automatic public-business candidates, configure one of:
+
+```text
+GOOGLE_PLACES_API_KEY=...   # official Places Text Search
+BRAVE_SEARCH_API_KEY=...    # Brave Web Search
+CLINIC_SEARCH_WEBHOOK_URL=... # operator-approved adapter
+```
+
+Google/Bing/DuckDuckGo result pages are not scraped automatically. Saved result HTML can still be imported. Google Places results without an official website are retained as high website-launch opportunities rather than discarded.
+
+Run `SUPABASE_SETUP.sql`, then configure `SUPABASE_URL` and the server-only `SUPABASE_SERVICE_ROLE_KEY`. Discovery results now support **Audit + score + save**; individual audits and Gemini SEO reviews can also be persisted with measured evidence, advisory scores and recommended web/SEO packages in the `raw` JSON column. The service-role key must never use a `NEXT_PUBLIC_` name.
+
 ```bash
 # Enable real delivery only after provider credentials and compliance review
 export SEND_ENABLED=true

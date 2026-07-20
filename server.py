@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
+import hmac
 import ipaddress
 import json
 import math
@@ -40,6 +41,42 @@ PDF_LINKS: dict[str, dict] = {}
 PDF_LINK_TTL = max(300, min(int(os.getenv("PDF_LINK_TTL_SECONDS", "86400")), 604800))
 PDF_LINK_LIMIT = max(10, min(int(os.getenv("PDF_LINK_LIMIT", "100")), 500))
 ALLOWED_CHANNELS = {"whatsapp", "telegram", "bale", "rubika", "soroush", "eitaa", "email", "sms", "divar"}
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def integration_auth_error(headers, path: str) -> tuple[int, str] | None:
+    """Validate Next.js → Python calls without exposing the shared token to a browser.
+
+    X-Clinic-Signal-Internal makes verification mandatory for the Next.js gateway.
+    CLINIC_SIGNAL_REQUIRE_AUTH=true optionally protects every /api route except signed PDF reads.
+    The standalone Clinic Signal browser UI needs the latter left false unless a separate login
+    or hosting-level access guard is configured.
+    """
+    if not path.startswith("/api/"):
+        return None
+    internal_call = str(headers.get("X-Clinic-Signal-Internal", "")).strip() == "1"
+    globally_required = env_flag("CLINIC_SIGNAL_REQUIRE_AUTH", False)
+    if not internal_call and not globally_required:
+        return None
+    if path in {"/api/shared-pdf"} and not internal_call:
+        return None
+
+    expected = os.getenv("CLINIC_SIGNAL_API_TOKEN", "").strip()
+    if len(expected) < 24:
+        return 503, "CLINIC_SIGNAL_API_TOKEN is missing or shorter than 24 characters."
+    authorization = str(headers.get("Authorization", ""))
+    provided = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
+    if not provided or not hmac.compare_digest(provided, expected):
+        return 401, "Invalid Clinic Signal integration token."
+    return None
+
+
 try:
     from PIL import Image, ImageDraw, ImageFont, features as pil_features
     PILLOW_AVAILABLE = True
@@ -83,6 +120,209 @@ def public_url(url: str) -> tuple[bool, str]:
         return False, f"Could not validate host: {type(exc).__name__}"
 
 
+DIGIT_TRANSLATION = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+EMAIL_PATTERN = re.compile(r"(?i)(?<![\w.+-])([a-z0-9][a-z0-9._%+-]{0,63}@[a-z0-9.-]+\.[a-z]{2,24})(?![\w.-])")
+PHONE_CANDIDATE_PATTERN = re.compile(r"(?<!\d)(?:\+|00)?[\d۰-۹٠-٩][\d۰-۹٠-٩\s().-]{6,20}[\d۰-۹٠-٩](?!\d)")
+CONTACT_PATH_PATTERN = re.compile(r"(?i)(contact|about|location|branch|clinic|office|support|تماس|درباره|شعب|آدرس)")
+SOCIAL_HOSTS = ("instagram.com", "linkedin.com", "facebook.com", "youtube.com", "aparat.com", "t.me", "eitaa.com", "rubika.ir", "splus.ir", "bale.ai")
+WHATSAPP_HOSTS = ("wa.me", "api.whatsapp.com", "web.whatsapp.com")
+
+
+def normalize_public_phone(value: str) -> str:
+    raw = str(value or "").translate(DIGIT_TRANSLATION).strip()
+    digits = re.sub(r"\D", "", raw)
+    if digits.startswith("0098"):
+        digits = digits[2:]
+    if digits.startswith("98") and 11 <= len(digits) <= 12:
+        return "+" + digits
+    if digits.startswith("0") and 10 <= len(digits) <= 11:
+        return "+98" + digits[1:]
+    if 8 <= len(digits) <= 15:
+        return ("+" if raw.startswith("+") else "") + digits
+    return ""
+
+
+def extract_public_phones(text: str) -> list[str]:
+    found = []
+    seen = set()
+    for match in PHONE_CANDIDATE_PATTERN.finditer(str(text or "")):
+        phone = normalize_public_phone(match.group(0))
+        digits = re.sub(r"\D", "", phone)
+        # Reject obvious dates and repeated placeholders while retaining public landlines/mobiles.
+        if not phone or len(set(digits)) < 3 or digits.startswith(("139", "140")) and len(digits) <= 8:
+            continue
+        if phone not in seen:
+            seen.add(phone)
+            found.append(phone)
+    return found[:20]
+
+
+def extract_public_contact_signals(html: str, base_url: str) -> dict:
+    """Extract public business contact signals only; never submit forms or access private pages."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    phones, emails, whatsapp_links, social_links, contact_pages, tags = set(), set(), set(), set(), set(), set()
+    base = urlparse(base_url)
+    base_host = (base.hostname or "").lower().removeprefix("www.")
+
+    for anchor in soup.find_all("a", href=True):
+        raw_href = str(anchor.get("href", "")).strip()
+        lower = raw_href.lower()
+        if lower.startswith("tel:"):
+            phone = normalize_public_phone(raw_href[4:].split("?", 1)[0])
+            if phone:
+                phones.add(phone)
+            continue
+        if lower.startswith("mailto:"):
+            email = raw_href[7:].split("?", 1)[0].strip().lower()
+            if EMAIL_PATTERN.fullmatch(email):
+                emails.add(email)
+            continue
+        absolute = urljoin(base_url, raw_href)
+        parsed = urlparse(absolute)
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        if parsed.scheme not in {"http", "https"} or not host:
+            continue
+        if host in WHATSAPP_HOSTS or host.endswith(".whatsapp.com"):
+            whatsapp_links.add(absolute.split("#", 1)[0])
+            query = parse_qs(parsed.query)
+            candidate = parsed.path.strip("/").split("/", 1)[0] if host == "wa.me" else (query.get("phone") or [""])[0]
+            phone = normalize_public_phone(candidate)
+            if phone:
+                phones.add(phone)
+            continue
+        if any(host == item or host.endswith("." + item) for item in SOCIAL_HOSTS):
+            social_links.add(absolute.split("#", 1)[0])
+        if host == base_host and CONTACT_PATH_PATTERN.search(unquote(parsed.path)):
+            contact_pages.add(absolute.split("#", 1)[0])
+
+    visible_text = soup.get_text(" ", strip=True)
+    phones.update(extract_public_phones(visible_text))
+    emails.update(x.group(1).lower() for x in EMAIL_PATTERN.finditer(visible_text))
+
+    for meta in soup.find_all("meta"):
+        key = str(meta.get("name") or meta.get("property") or "").lower()
+        value = str(meta.get("content", "")).strip()
+        if key in {"keywords", "news_keywords", "article:tag"}:
+            tags.update(x.strip()[:80] for x in re.split(r"[,،|]", value) if x.strip())
+
+    addresses = []
+    address_tag = soup.find("address")
+    if address_tag:
+        value = " ".join(address_tag.get_text(" ", strip=True).split())
+        if value:
+            addresses.append(value[:500])
+
+    def walk_json(value):
+        if isinstance(value, list):
+            for item in value:
+                walk_json(item)
+        elif isinstance(value, dict):
+            telephone = value.get("telephone")
+            if telephone:
+                phone = normalize_public_phone(str(telephone))
+                if phone:
+                    phones.add(phone)
+            email = str(value.get("email", "")).removeprefix("mailto:").strip().lower()
+            if email and EMAIL_PATTERN.fullmatch(email):
+                emails.add(email)
+            for key in ("keywords", "medicalSpecialty", "serviceType", "knowsAbout"):
+                values = value.get(key, [])
+                if not isinstance(values, list):
+                    values = re.split(r"[,،|]", str(values))
+                tags.update(str(x).strip()[:80] for x in values if str(x).strip())
+            address = value.get("address")
+            if isinstance(address, dict):
+                rendered = "، ".join(str(address.get(k, "")).strip() for k in ("addressCountry", "addressRegion", "addressLocality", "streetAddress", "postalCode") if address.get(k))
+                if rendered:
+                    addresses.append(rendered[:500])
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    walk_json(child)
+
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            walk_json(json.loads(script.get_text(strip=True) or "{}"))
+        except Exception:
+            continue
+
+    whatsapp_number = ""
+    for link in sorted(whatsapp_links):
+        parsed = urlparse(link)
+        query = parse_qs(parsed.query)
+        candidate = parsed.path.strip("/").split("/", 1)[0] if (parsed.hostname or "").lower() == "wa.me" else (query.get("phone") or [""])[0]
+        whatsapp_number = normalize_public_phone(candidate)
+        if whatsapp_number:
+            break
+
+    return {
+        "phoneNumbers": sorted(phones)[:20],
+        "emails": sorted(emails)[:20],
+        "whatsappLinks": sorted(whatsapp_links)[:10],
+        "whatsappNumber": whatsapp_number,
+        "socialLinks": sorted(social_links)[:20],
+        "contactPageCandidates": sorted(contact_pages)[:10],
+        "tags": sorted(tags, key=str.casefold)[:40],
+        "addresses": list(dict.fromkeys(addresses))[:8],
+    }
+
+
+def enrich_public_business_contacts(url: str, max_pages: int = 3) -> dict:
+    """Crawl a few same-origin public contact/about pages, respecting robots.txt."""
+    if not urlparse(url).scheme:
+        url = "https://" + url.strip()
+    ok, reason = public_url(url)
+    if not ok:
+        raise ValueError(reason)
+    max_pages = max(1, min(int(max_pages or 3), 5))
+    status, final_url, html, content_type, elapsed = fetch(url, timeout=15, limit=1_500_000)
+    if status >= 400 or ("html" not in content_type.lower() and "<html" not in html[:1000].lower()):
+        raise ValueError(f"Website returned HTTP {status} or non-HTML content.")
+
+    base_host = (urlparse(final_url).hostname or "").lower().removeprefix("www.")
+    aggregate = extract_public_contact_signals(html, final_url)
+    pages = [{"url": final_url, "status": status, "title": ""}]
+    parser = AuditParser(final_url)
+    parser.feed(html)
+    pages[0]["title"] = parser.title
+
+    candidates = list(aggregate.pop("contactPageCandidates", []))
+    for page_url in candidates:
+        if len(pages) >= max_pages:
+            break
+        host = (urlparse(page_url).hostname or "").lower().removeprefix("www.")
+        if host != base_host or not robots_allows(page_url):
+            continue
+        try:
+            page_status, page_final, page_html, page_type, _ = fetch(page_url, timeout=12, limit=1_000_000)
+            if page_status >= 400 or ("html" not in page_type.lower() and "<html" not in page_html[:1000].lower()):
+                continue
+            signals = extract_public_contact_signals(page_html, page_final)
+            for key in ("phoneNumbers", "emails", "whatsappLinks", "socialLinks", "tags", "addresses"):
+                aggregate[key] = list(dict.fromkeys([*aggregate.get(key, []), *signals.get(key, [])]))[:40]
+            if not aggregate.get("whatsappNumber") and signals.get("whatsappNumber"):
+                aggregate["whatsappNumber"] = signals["whatsappNumber"]
+            page_parser = AuditParser(page_final)
+            page_parser.feed(page_html)
+            pages.append({"url": page_final, "status": page_status, "title": page_parser.title})
+        except Exception:
+            continue
+
+    phones = aggregate.get("phoneNumbers", [])
+    emails = aggregate.get("emails", [])
+    return {
+        "ok": True,
+        "requestedUrl": url,
+        "finalUrl": final_url,
+        "status": status,
+        "elapsedSeconds": elapsed,
+        "primaryPhone": phones[0] if phones else "",
+        "primaryEmail": emails[0] if emails else "",
+        **aggregate,
+        "pagesChecked": pages,
+        "disclaimer": "Public business contact signals only. Verify ownership and recipient consent before outreach; no forms, accounts or patient data were accessed.",
+    }
+
+
 class SafeRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         absolute = urljoin(req.full_url, newurl)
@@ -110,6 +350,7 @@ class AuditParser(HTMLParser):
         self.phone_links: set[str] = set()
         self.email_links: set[str] = set()
         self.text_chars = 0
+        self.text_words = 0
         self.phone_signal = False
         self.address_signal = False
         self.map_or_social_signal = False
@@ -188,6 +429,7 @@ class AuditParser(HTMLParser):
         clean = " ".join(data.split())
         if clean:
             self.text_chars += len(clean)
+            self.text_words += len(clean.split())
             low = clean.lower()
             if re.search(r'(?:\+?98|0)?21[-\s]?\d{5,8}', clean) or re.search(r'09\d{9}', clean):
                 self.phone_signal = True
@@ -333,9 +575,11 @@ def audit(url: str):
         return {"ok": True, "requestedUrl": url, "status": 0, "finalUrl": url,
                 "elapsedSeconds": round(time.monotonic()-started, 2), "totalSeconds": round(time.monotonic()-started, 2),
                 "title": "", "titleLength": 0, "description": "", "descriptionLength": 0,
-                "h1Count": 0, "h1": [], "canonical": "", "lang": "", "schemaTypes": [],
+                "h1Count": 0, "h1": [], "canonical": "", "lang": "", "viewport": False,
+                "schemaBlocks": 0, "schemaTypes": [], "wordCount": 0,
                 "internalLinks": 0, "externalLinks": 0, "internalLinkSamples": [], "externalLinkSamples": [],
-                "socialLinks": [], "phoneLinks": [], "emailLinks": [], "textCharacters": 0,
+                "socialLinks": [], "phoneLinks": [], "emailLinks": [], "whatsappLinks": [],
+                "whatsappNumber": "", "tags": [], "publicAddresses": [], "contactPageCandidates": [], "textCharacters": 0,
                 "robots": False, "sitemap": False, "seoScore": 5, "sslError": True,
                 "issues": ["SSL certificate validation failed or the certificate has expired", message[:300]],
                 "wins": [], "checkedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -344,6 +588,7 @@ def audit(url: str):
         raise ValueError("The URL did not return an HTML page.")
     parser = AuditParser(final_url)
     parser.feed(html)
+    contacts = extract_public_contact_signals(html, final_url)
     robots = endpoint_exists(final_url, "robots.txt")
     sitemap = endpoint_exists(final_url, "sitemap.xml")
     score, issues, wins = score_audit(status, final_url, parser, robots, sitemap)
@@ -370,14 +615,22 @@ def audit(url: str):
         "h1": parser.h1[:3],
         "canonical": parser.canonical,
         "lang": parser.lang,
+        "viewport": parser.viewport,
+        "schemaBlocks": parser.schema_blocks,
         "schemaTypes": sorted(parser.schema_types),
+        "wordCount": parser.text_words,
         "internalLinks": len(internal_urls),
         "externalLinks": len(external_urls),
         "internalLinkSamples": internal_urls[:24],
         "externalLinkSamples": external_urls[:16],
-        "socialLinks": sorted(parser.social_links)[:16],
-        "phoneLinks": sorted(parser.phone_links)[:12],
-        "emailLinks": sorted(parser.email_links)[:12],
+        "socialLinks": list(dict.fromkeys([*sorted(parser.social_links), *contacts["socialLinks"]]))[:20],
+        "phoneLinks": list(dict.fromkeys([*sorted(parser.phone_links), *contacts["phoneNumbers"]]))[:20],
+        "emailLinks": list(dict.fromkeys([*sorted(parser.email_links), *contacts["emails"]]))[:20],
+        "whatsappLinks": contacts["whatsappLinks"],
+        "whatsappNumber": contacts["whatsappNumber"],
+        "tags": contacts["tags"],
+        "publicAddresses": contacts["addresses"],
+        "contactPageCandidates": contacts["contactPageCandidates"],
         "textCharacters": parser.text_chars,
         "robots": robots,
         "sitemap": sitemap,
@@ -411,9 +664,16 @@ def provider_status():
         "dryRun": DRY_RUN,
         "providers": providers,
         "vendorSearchConfigured": bool(os.getenv("VENDOR_SEARCH_WEBHOOK_URL")),
-        "clinicSearchConfigured": bool(os.getenv("CLINIC_SEARCH_WEBHOOK_URL") or os.getenv("BRAVE_SEARCH_API_KEY")),
+        "clinicSearchConfigured": bool(os.getenv("CLINIC_SEARCH_WEBHOOK_URL") or os.getenv("BRAVE_SEARCH_API_KEY") or os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY")),
+        "clinicSearchProviders": {
+            "webhook": bool(os.getenv("CLINIC_SEARCH_WEBHOOK_URL")),
+            "googlePlaces": bool(os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY")),
+            "brave": bool(os.getenv("BRAVE_SEARCH_API_KEY")),
+        },
         "geminiConfigured": bool(get_gemini_keys()),
         "scraperConfigured": bool(scraper_allowed_domains()),
+        "contactEnrichmentEnabled": True,
+        "contactEnrichmentMaxPages": max(1, min(int(os.getenv("CONTACT_ENRICH_MAX_PAGES", "3")), 5)),
         "leadDatabaseConfigured": bool(database["configured"] or webhook_database),
         "leadDatabaseProvider": "supabase" if database["configured"] else "webhook" if webhook_database else "none",
         "leadDatabaseTable": database["table"],
@@ -1121,15 +1381,68 @@ def search_clinics(payload: dict):
             items.append({
                 "name": str(item.get("name", ""))[:180],
                 "website": str(item.get("website", ""))[:500],
-                "phone": str(item.get("phone", ""))[:100],
+                "phone": normalize_public_phone(str(item.get("phone", "")))[:100],
+                "email": str(item.get("email", ""))[:180],
+                "whatsapp": normalize_public_phone(str(item.get("whatsapp", "")))[:100],
+                "whatsappLinks": [str(x)[:500] for x in item.get("whatsappLinks", [])[:10]] if isinstance(item.get("whatsappLinks"), list) else [],
                 "address": str(item.get("address", ""))[:500],
                 "specialty": str(item.get("specialty", specialty))[:150],
+                "tags": [str(x)[:80] for x in item.get("tags", [])[:30]] if isinstance(item.get("tags"), list) else [],
                 "source": str(item.get("source", item.get("evidence", "")))[:500],
                 "summary": str(item.get("summary", ""))[:600],
                 "verified": bool(item.get("verified", False)),
             })
         return {"ok": True, "configured": True, "mode": "api", "provider": "webhook", "providerStatus": status, "items": items,
                 "disclaimer": "Candidates only. Verify medical license, identity, public contact details and active status independently."}
+    google_places_key = os.getenv("GOOGLE_PLACES_API_KEY", "").strip() or os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+    if google_places_key and (not engines or "google" in engines):
+        field_mask = ",".join([
+            "places.id", "places.displayName", "places.formattedAddress",
+            "places.nationalPhoneNumber", "places.internationalPhoneNumber",
+            "places.websiteUri", "places.googleMapsUri", "places.primaryTypeDisplayName",
+            "places.businessStatus",
+        ])
+        status, response = post_json(
+            "https://places.googleapis.com/v1/places:searchText",
+            {"textQuery": combined, "languageCode": "fa", "pageSize": 20},
+            {"X-Goog-Api-Key": google_places_key, "X-Goog-FieldMask": field_mask},
+            timeout=25,
+        )
+        places = response.get("places", []) if isinstance(response, dict) else []
+        items = []
+        for place in places[:20]:
+            if not isinstance(place, dict):
+                continue
+            display = place.get("displayName") if isinstance(place.get("displayName"), dict) else {}
+            primary_type = place.get("primaryTypeDisplayName") if isinstance(place.get("primaryTypeDisplayName"), dict) else {}
+            website = str(place.get("websiteUri", ""))[:500]
+            maps_url = str(place.get("googleMapsUri", ""))[:500]
+            business_status = str(place.get("businessStatus", ""))[:60]
+            no_site = not bool(website)
+            items.append({
+                "name": str(display.get("text", ""))[:180],
+                "website": website,
+                "phone": normalize_public_phone(str(place.get("internationalPhoneNumber") or place.get("nationalPhoneNumber") or ""))[:100],
+                "email": "", "whatsapp": "", "whatsappLinks": [],
+                "address": str(place.get("formattedAddress", ""))[:500],
+                "specialty": str(primary_type.get("text") or specialty)[:150],
+                "tags": [str(primary_type.get("text") or specialty)[:80]],
+                "source": maps_url,
+                "summary": f"Google Places public business result. Status: {business_status or 'not provided'}",
+                "verified": False,
+                "resultType": "structured-medical-entity",
+                "placeId": str(place.get("id", ""))[:200],
+                "websiteStatus": "no-website-found" if no_site else "official-website-provided",
+                "seoScore": 0 if no_site else 45,
+                "opportunityScore": 94 if no_site else 65,
+                "recommendedPackage": "Website Launch + Local SEO" if no_site else "SEO Audit + Web Design Review",
+            })
+        return {
+            "ok": True, "configured": True, "mode": "api", "provider": "google-places",
+            "providerStatus": status, "items": items,
+            "disclaimer": "Google Places results are public business candidates, not medical-quality rankings. Verify identity, license, official website and contact details independently.",
+        }
+
     brave_key = os.getenv("BRAVE_SEARCH_API_KEY", "")
     if brave_key:
         params = urlencode({"q": combined, "count": 20, "search_lang": "fa", "safesearch": "strict"})
@@ -1142,7 +1455,8 @@ def search_clinics(payload: dict):
                 continue
             items.append({"name": str(result.get("title", ""))[:180],
                           "website": str(result.get("url", ""))[:500],
-                          "phone": "", "address": "", "specialty": specialty,
+                          "phone": "", "email": "", "whatsapp": "", "whatsappLinks": [],
+                          "address": "", "specialty": specialty, "tags": [],
                           "source": str(result.get("url", ""))[:500],
                           "summary": str(result.get("description", ""))[:600],
                           "verified": False})
@@ -1156,7 +1470,7 @@ def search_clinics(payload: dict):
         "configured": False,
         "mode": "links",
         "items": [],
-        "requiredConfiguration": ["BRAVE_SEARCH_API_KEY", "CLINIC_SEARCH_WEBHOOK_URL"],
+        "requiredConfiguration": ["GOOGLE_PLACES_API_KEY", "BRAVE_SEARCH_API_KEY", "CLINIC_SEARCH_WEBHOOK_URL"],
         "searchLinks": {
             "duckduckgo": "https://duckduckgo.com/?q=" + encoded,
             "google": "https://www.google.com/search?q=" + encoded,
@@ -1256,10 +1570,14 @@ def parse_search_html(payload: dict):
         text = re.sub(r"https?://\S+", "", text)
         text = re.sub(r"\s{2,}", " ", text).strip()
         phone_match = re.search(r"(?:\+?98|0)?(?:21[-\s]?\d{5,8}|9\d{9})", text)
+        signals = extract_public_contact_signals(str(container or anchor), source_url or url)
         result_type, action = classify_search_candidate(title, url)
         items.append({"name": title[:180], "website": url[:500],
                       "domain": (urlparse(url).hostname or "")[:200],
-                      "phone": phone_match.group(0) if phone_match else "", "address": "",
+                      "phone": (signals["phoneNumbers"][0] if signals["phoneNumbers"] else phone_match.group(0) if phone_match else ""),
+                      "email": signals["emails"][0] if signals["emails"] else "",
+                      "whatsapp": signals["whatsappNumber"], "whatsappLinks": signals["whatsappLinks"],
+                      "tags": signals["tags"], "address": signals["addresses"][0] if signals["addresses"] else "",
                       "specialty": specialty, "source": source_url or url[:500],
                       "summary": text[:600], "resultType": result_type,
                       "recommendedAction": action, "verified": False})
@@ -1294,9 +1612,22 @@ def parse_search_html(payload: dict):
             if isinstance(address, dict):
                 address = "، ".join(str(address.get(k, "")) for k in ("addressLocality", "streetAddress") if address.get(k))
             seen.add(key)
+            same_as = node.get("sameAs", [])
+            if not isinstance(same_as, list):
+                same_as = [same_as]
+            whatsapp_links = [str(x)[:500] for x in same_as if any(h in str(x).lower() for h in WHATSAPP_HOSTS)]
+            whatsapp_number = ""
+            if whatsapp_links:
+                whatsapp_number = extract_public_contact_signals(f'<a href="{whatsapp_links[0]}">WhatsApp</a>', url or source_url)["whatsappNumber"]
+            node_tags = node.get("keywords", [])
+            if not isinstance(node_tags, list):
+                node_tags = [x.strip() for x in re.split(r"[,،|]", str(node_tags)) if x.strip()]
             items.append({"name": name[:180], "website": url[:500],
                           "domain": (urlparse(url).hostname or "")[:200],
-                          "phone": str(node.get("telephone", ""))[:100], "address": str(address)[:500],
+                          "phone": normalize_public_phone(str(node.get("telephone", "")))[:100],
+                          "email": str(node.get("email", "")).removeprefix("mailto:")[:180],
+                          "whatsapp": whatsapp_number, "whatsappLinks": whatsapp_links,
+                          "tags": [str(x)[:80] for x in node_tags[:20]], "address": str(address)[:500],
                           "specialty": specialty, "source": source_url or url,
                           "summary": str(node.get("description", ""))[:600],
                           "resultType": "structured-medical-entity",
@@ -1331,6 +1662,7 @@ def enrich_clinic_candidates(payload: dict):
             status, final_url, html, content_type, _ = fetch(url, timeout=15, limit=1_500_000)
             if status != 200 or ("html" not in content_type.lower() and "<html" not in html[:1000].lower()):
                 raise ValueError(f"HTTP {status} or non-HTML response")
+            contact_signals = extract_public_contact_signals(html, final_url)
             parsed = parse_search_html({"html": html, "engine": "generic", "sourceUrl": final_url,
                                         "specialty": specialty}).get("items", [])
             useful = []
@@ -1357,8 +1689,11 @@ def enrich_clinic_candidates(payload: dict):
                     seen.add(key)
                     enriched.append({"name": name[:180], "website": final_url[:500],
                                      "domain": (urlparse(final_url).hostname or "")[:200],
-                                     "phone": next(iter(parser.phone_links), str(candidate.get("phone", "")))[:100],
-                                     "address": str(candidate.get("address", ""))[:500],
+                                     "phone": (contact_signals["phoneNumbers"][0] if contact_signals["phoneNumbers"] else str(candidate.get("phone", "")))[:100],
+                                     "email": (contact_signals["emails"][0] if contact_signals["emails"] else str(candidate.get("email", "")))[:180],
+                                     "whatsapp": contact_signals["whatsappNumber"] or str(candidate.get("whatsapp", ""))[:100],
+                                     "whatsappLinks": contact_signals["whatsappLinks"], "tags": contact_signals["tags"],
+                                     "address": (contact_signals["addresses"][0] if contact_signals["addresses"] else str(candidate.get("address", "")))[:500],
                                      "specialty": specialty, "source": final_url,
                                      "summary": parser.description[:600], "resultType": kind,
                                      "recommendedAction": action, "verified": False, "enriched": True})
@@ -1581,12 +1916,33 @@ def supabase_settings():
             "configured": bool(url and key)}
 
 
+def lead_dedupe_key(item: dict, website: str) -> str:
+    if website:
+        try:
+            parsed = urlparse(website if urlparse(website).scheme else "https://" + website)
+            host = (parsed.hostname or "").lower().removeprefix("www.")
+            if host:
+                return "website:" + host[:220]
+        except Exception:
+            pass
+    identity = "|".join([
+        str(item.get("placeId", "")), str(item.get("name", "")),
+        str(item.get("phone", "")), str(item.get("address", item.get("area", ""))),
+        str(item.get("source", "")),
+    ]).strip("|").lower()
+    return "entity:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 def normalize_lead_row(item: dict):
     website = str(item.get("website", "")).strip()[:500]
     return {
+        "dedupe_key": lead_dedupe_key(item, website),
         "name": str(item.get("name", "Clinic candidate"))[:180],
         "website": website,
         "phone": str(item.get("phone", ""))[:100],
+        "email": str(item.get("email", ""))[:180],
+        "whatsapp": str(item.get("whatsapp", item.get("whatsappNumber", "")))[:100],
+        "tags": [str(x)[:80] for x in item.get("tags", [])[:40]] if isinstance(item.get("tags"), list) else [],
         "address": str(item.get("address", item.get("area", "")))[:500],
         "specialty": str(item.get("specialty", item.get("services", "")))[:180],
         "source": str(item.get("source", ""))[:500],
@@ -1600,13 +1956,13 @@ def normalize_lead_row(item: dict):
 
 def persist_leads_database(items: list[dict]):
     rows = [normalize_lead_row(item) for item in items[:100] if isinstance(item, dict)]
-    rows = [row for row in rows if row["website"]]
+    rows = [row for row in rows if row["name"] and (row["website"] or row["phone"] or row["email"] or row["whatsapp"] or row["address"] or row["source"])]
     if not rows:
-        raise ValueError("No valid lead rows were supplied.")
+        raise ValueError("No valid lead rows were supplied. A name plus website, phone, address or source is required.")
     settings = supabase_settings()
     supabase_url, supabase_key, table = settings["url"], settings["key"], settings["table"]
     if settings["configured"]:
-        endpoint = f"{supabase_url}/rest/v1/{table}?on_conflict=website"
+        endpoint = f"{supabase_url}/rest/v1/{table}?on_conflict=dedupe_key"
         response = requests.post(endpoint, headers={"apikey": supabase_key,
             "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json",
             "Prefer": "resolution=merge-duplicates,return=representation"}, json=rows, timeout=30)
@@ -2069,8 +2425,14 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        auth_error = integration_auth_error(self.headers, path)
+        if auth_error:
+            status, message = auth_error
+            return self.json_response({"ok": False, "error": message}, status)
         if path == "/api/health":
-            return self.json_response({"ok": True, "service": "Clinic Signal", "mode": "live-audit-and-messaging"})
+            verified = self.headers.get("X-Clinic-Signal-Internal", "") == "1"
+            return self.json_response({"ok": True, "service": "Clinic Signal", "mode": "live-audit-and-messaging",
+                                       "integrationAuth": "verified" if verified else "not-requested"})
         if path == "/api/integrations":
             return self.json_response(provider_status())
         if path == "/api/send-log":
@@ -2108,7 +2470,11 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in {"/api/audit", "/api/ai-seo-review", "/api/analyze-clinic-candidates", "/api/send", "/api/vendor-search", "/api/clinic-search", "/api/import-search-html", "/api/enrich-clinics", "/api/scrape-directory", "/api/exhibition/import", "/api/exhibition/enrich", "/api/leads/bulk", "/api/export-clinics", "/api/generate-article", "/api/proposal-pdf", "/api/proposal-link"}:
+        auth_error = integration_auth_error(self.headers, path)
+        if auth_error:
+            status, message = auth_error
+            return self.json_response({"ok": False, "error": message}, status)
+        if path not in {"/api/audit", "/api/ai-seo-review", "/api/analyze-clinic-candidates", "/api/send", "/api/vendor-search", "/api/clinic-search", "/api/import-search-html", "/api/enrich-clinics", "/api/scrape-directory", "/api/contact-enrich", "/api/exhibition/import", "/api/exhibition/enrich", "/api/leads/bulk", "/api/export-clinics", "/api/generate-article", "/api/proposal-pdf", "/api/proposal-link"}:
             return self.json_response({"ok": False, "error": "Not found"}, 404)
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -2156,6 +2522,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.json_response(enrich_clinic_candidates(payload))
             if path == "/api/scrape-directory":
                 return self.json_response(scrape_clinic_directory(payload))
+            if path == "/api/contact-enrich":
+                return self.json_response(enrich_public_business_contacts(
+                    str(payload.get("url", "")).strip(), int(payload.get("maxPages", 3) or 3)))
             if path == "/api/exhibition/import":
                 return self.json_response(parse_exhibition_data(payload))
             if path == "/api/exhibition/enrich":
@@ -2181,6 +2550,7 @@ class Handler(SimpleHTTPRequestHandler):
                      "Search HTML import" if path == "/api/import-search-html" else
                      "Clinic enrichment" if path == "/api/enrich-clinics" else
                      "Directory scraper" if path == "/api/scrape-directory" else
+                     "Public contact enrichment" if path == "/api/contact-enrich" else
                      "Exhibition import" if path == "/api/exhibition/import" else
                      "Exhibition enrichment" if path == "/api/exhibition/enrich" else
                      "Lead database" if path == "/api/leads/bulk" else

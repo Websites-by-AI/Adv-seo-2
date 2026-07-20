@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 from server import (  # noqa: E402
     PILLOW_AVAILABLE,
     SEND_LOG,
+    integration_auth_error,
     audit,
     generate_seo_article,
     generate_ai_seo_review,
@@ -31,6 +32,7 @@ from server import (  # noqa: E402
     search_clinics,
     parse_search_html,
     enrich_clinic_candidates,
+    enrich_public_business_contacts,
     scrape_clinic_directory,
     parse_exhibition_data,
     enrich_exhibition_companies,
@@ -104,6 +106,15 @@ def unpack_proposal(token: str):
         raise ValueError(f"Invalid PDF link: {type(exc).__name__}") from exc
 
 
+@app.before_request
+def verify_integration_request():
+    auth_error = integration_auth_error(request.headers, request.path)
+    if auth_error:
+        status, message = auth_error
+        return jsonify(ok=False, error=message), status
+    return None
+
+
 @app.after_request
 def security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -114,7 +125,13 @@ def security_headers(response):
 
 @app.get("/api/health")
 def health():
-    return jsonify(ok=True, service="Clinic Signal", mode="vercel-serverless")
+    verified = request.headers.get("X-Clinic-Signal-Internal", "") == "1"
+    return jsonify(
+        ok=True,
+        service="Clinic Signal",
+        mode="vercel-serverless",
+        integrationAuth="verified" if verified else "not-requested",
+    )
 
 
 @app.get("/api/integrations")
@@ -177,6 +194,15 @@ def enrich_clinics_route():
 @app.post("/api/scrape-directory")
 def scrape_directory_route():
     return jsonify(scrape_clinic_directory(json_body()))
+
+
+@app.post("/api/contact-enrich")
+def contact_enrich_route():
+    data = json_body()
+    return jsonify(enrich_public_business_contacts(
+        str(data.get("url", "")).strip(),
+        int(data.get("maxPages", 3) or 3),
+    ))
 
 
 @app.post("/api/exhibition/import")
