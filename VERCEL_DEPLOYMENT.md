@@ -91,6 +91,19 @@ DRY_RUN=false
 
 ---
 
+## Company AI-video adapter
+
+The company video studio creates a factual 30–60 second 16:9 script/storyboard and submits only human-approved, rights-confirmed plans to an asynchronous renderer:
+
+```text
+VIDEO_PROVIDER=adapter
+VIDEO_RENDER_WEBHOOK_URL=https://YOUR-WORKER.example/render
+VIDEO_RENDER_STATUS_WEBHOOK_URL=https://YOUR-WORKER.example/status
+VIDEO_RENDER_WEBHOOK_TOKEN=server-only-secret
+```
+
+The adapter may wrap Google Veo, fal.ai/Kling, Runway or another authorized provider. Never place provider keys in browser variables. If the adapter is absent, render requests remain safe dry runs.
+
 ## PDF links on Vercel
 
 Vercel Functions are stateless, so the Vercel adapter does not rely on in-memory PDF storage.

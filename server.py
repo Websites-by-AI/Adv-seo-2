@@ -674,6 +674,13 @@ def provider_status():
         "scraperConfigured": bool(scraper_allowed_domains()),
         "contactEnrichmentEnabled": True,
         "contactEnrichmentMaxPages": max(1, min(int(os.getenv("CONTACT_ENRICH_MAX_PAGES", "3")), 5)),
+        "video": {
+            "provider": os.getenv("VIDEO_PROVIDER", "adapter"),
+            "scriptAiConfigured": bool(get_gemini_keys()),
+            "renderConfigured": bool(os.getenv("VIDEO_RENDER_WEBHOOK_URL")),
+            "statusConfigured": bool(os.getenv("VIDEO_RENDER_STATUS_WEBHOOK_URL")),
+            "mode": "async-provider-adapter",
+        },
         "leadDatabaseConfigured": bool(database["configured"] or webhook_database),
         "leadDatabaseProvider": "supabase" if database["configured"] else "webhook" if webhook_database else "none",
         "leadDatabaseTable": database["table"],
@@ -916,6 +923,243 @@ def parse_ai_json(text: str):
         return json.loads(cleaned[start:end + 1])
     except json.JSONDecodeError as exc:
         raise ValueError(f"Gemini returned invalid JSON: {exc.msg}") from exc
+
+
+def deterministic_company_video_plan(company: dict, language: str, duration: int, objective: str) -> dict:
+    name = str(company.get("name", "Business")).strip()[:180] or "Business"
+    category = str(company.get("category", company.get("specialty", "business"))).strip()[:180]
+    website = str(company.get("website", "")).strip()[:500]
+    address = str(company.get("address", "")).strip()[:300]
+    tags = company.get("tags", []) if isinstance(company.get("tags"), list) else []
+    services = "، ".join(str(tag)[:60] for tag in tags[:5]) or category or ("خدمات عمومی" if language == "fa" else "public services")
+    shot_count = 5
+    base_duration, remainder = divmod(duration, shot_count)
+    durations = [base_duration + (1 if index < remainder else 0) for index in range(shot_count)]
+    if language == "en":
+        narration = [
+            f"Meet {name}.",
+            f"The company publicly presents its work in {services}.",
+            f"Its public business information is available through {website or 'its verified contact channels'}.",
+            f"This introduction is based only on reviewed company information for the objective: {objective}.",
+            f"To learn more, visit the official website or contact {name} through a verified business channel.",
+        ]
+        on_screen = [name, services, website or address or "Verified business information", "Human-reviewed company introduction", "Learn more"]
+    else:
+        narration = [
+            f"با {name} آشنا شوید.",
+            f"این مجموعه در اطلاعات عمومی خود، در حوزه {services} فعالیت می‌کند.",
+            f"اطلاعات رسمی کسب‌وکار از طریق {website or 'کانال‌های تماس تأییدشده'} در دسترس است.",
+            f"این معرفی فقط بر پایه اطلاعات بازبینی‌شده شرکت و با هدف «{objective}» تهیه شده است.",
+            f"برای اطلاعات بیشتر، وب‌سایت رسمی یا کانال تماس تأییدشده {name} را بررسی کنید.",
+        ]
+        on_screen = [name, services, website or address or "اطلاعات عمومی تأییدشده", "معرفی بازبینی‌شده شرکت", "اطلاعات بیشتر"]
+    visual_templates = [
+        "Authorized logo or clean typographic company-name reveal; no invented logo",
+        "Professional abstract service montage based only on the supplied categories and authorized assets",
+        "Clean website and public-contact presentation; do not fabricate interfaces, awards or reviews",
+        "Human-centered business operations montage without unverifiable performance or outcome claims",
+        "Company name, official website/contact call-to-action and legal brand-safe closing frame",
+    ]
+    shots = []
+    for index in range(shot_count):
+        shots.append({
+            "id": index + 1,
+            "durationSeconds": durations[index],
+            "visualPrompt": f"16:9 professional company introduction for {name}. {visual_templates[index]}. Consistent brand-neutral lighting, no text artifacts.",
+            "narration": narration[index],
+            "onScreenText": on_screen[index],
+            "evidence": [value for value in (name, category, website, address) if value][:4],
+        })
+    return {
+        "title": f"{name} — {'Company Introduction' if language == 'en' else 'ویدیوی معرفی شرکت'}",
+        "language": language,
+        "aspectRatio": "16:9",
+        "durationSeconds": duration,
+        "objective": objective,
+        "narration": " ".join(narration),
+        "shots": shots,
+        "cta": narration[-1],
+        "factualConstraints": [
+            "Use only supplied public company facts and operator-authorized assets.",
+            "Do not invent rankings, revenue, customers, awards, licenses, reviews or medical outcomes.",
+            "Human approval and brand/media rights confirmation are required before rendering.",
+        ],
+    }
+
+
+def normalize_company_video_plan(plan: dict, company: dict, language: str, duration: int, objective: str) -> dict:
+    fallback = deterministic_company_video_plan(company, language, duration, objective)
+    if not isinstance(plan, dict):
+        return fallback
+    shots = plan.get("shots") if isinstance(plan.get("shots"), list) else []
+    clean_shots = []
+    for index, shot in enumerate(shots[:8]):
+        if not isinstance(shot, dict):
+            continue
+        try:
+            shot_duration = max(3, min(15, int(shot.get("durationSeconds", 6))))
+        except (TypeError, ValueError):
+            shot_duration = 6
+        clean_shots.append({
+            "id": index + 1,
+            "durationSeconds": shot_duration,
+            "visualPrompt": str(shot.get("visualPrompt", ""))[:1200],
+            "narration": str(shot.get("narration", ""))[:800],
+            "onScreenText": str(shot.get("onScreenText", ""))[:180],
+            "evidence": [str(x)[:300] for x in shot.get("evidence", [])[:6]] if isinstance(shot.get("evidence"), list) else [],
+        })
+    if not clean_shots:
+        clean_shots = fallback["shots"]
+    result = {
+        **fallback,
+        "title": str(plan.get("title", fallback["title"]))[:250],
+        "narration": str(plan.get("narration", fallback["narration"]))[:5000],
+        "shots": clean_shots,
+        "cta": str(plan.get("cta", fallback["cta"]))[:800],
+    }
+    return result
+
+
+def generate_company_video_plan(payload: dict):
+    company = payload.get("company") if isinstance(payload.get("company"), dict) else {}
+    if not str(company.get("name", "")).strip():
+        raise ValueError("Company name is required for a video plan.")
+    language = "en" if str(payload.get("language", "fa")).lower() == "en" else "fa"
+    try:
+        duration = max(30, min(60, int(payload.get("durationSeconds", 45))))
+    except (TypeError, ValueError):
+        duration = 45
+    objective = str(payload.get("objective", "company introduction")).strip()[:500] or "company introduction"
+    fallback = deterministic_company_video_plan(company, language, duration, objective)
+    if not get_gemini_keys():
+        return {
+            "ok": True,
+            "configured": False,
+            "generator": "deterministic-draft",
+            "plan": fallback,
+            "disclaimer": "Gemini is not configured. This factual draft must be reviewed and can be regenerated with Gemini later.",
+        }
+    prompt = f"""Create a factual 30–60 second horizontal company-introduction video plan. Return JSON only.
+Output language: {'English' if language == 'en' else 'Persian'}
+Duration: {duration} seconds
+Aspect ratio: 16:9
+Objective: {objective}
+Reviewed company data:
+{json.dumps(company, ensure_ascii=False, indent=2)[:10000]}
+
+Rules:
+- Use only supplied facts. Never invent rankings, revenue, customer counts, awards, certifications, reviews, medical licenses, treatment outcomes or guarantees.
+- For medical businesses, describe only public services and require qualified medical/brand review.
+- Do not use patient information or imply endorsement.
+- Assume logos, images and people may be used only after the operator confirms rights.
+- Produce 4–8 shots whose durations total approximately {duration} seconds.
+- Keep on-screen text short and avoid text inside generated imagery; text will be overlaid later.
+
+Schema:
+{{
+  "title":"string",
+  "narration":"string",
+  "cta":"string",
+  "shots":[{{
+    "durationSeconds":6,
+    "visualPrompt":"string",
+    "narration":"string",
+    "onScreenText":"string",
+    "evidence":["exact supplied fact"]
+  }}]
+}}
+"""
+    raw, key_number, model = call_gemini(prompt, temperature=0.35, max_tokens=5000)
+    plan = normalize_company_video_plan(parse_ai_json(raw), company, language, duration, objective)
+    return {
+        "ok": True,
+        "configured": True,
+        "generator": "gemini",
+        "model": model,
+        "keyNumber": key_number,
+        "plan": plan,
+        "disclaimer": "AI-generated script and prompts require factual, legal and brand-rights review before rendering.",
+    }
+
+
+def safe_public_media_url(value: str) -> str:
+    candidate = str(value or "").strip()[:1000]
+    try:
+        parsed = urlparse(candidate)
+        if parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password:
+            return candidate
+    except Exception:
+        pass
+    return ""
+
+
+def submit_company_video_render(payload: dict):
+    if payload.get("humanApproved") is not True:
+        raise ValueError("Human approval of the script and storyboard is required.")
+    if payload.get("brandRightsConfirmed") is not True:
+        raise ValueError("Authorization for the company name, logo, people and uploaded media must be confirmed.")
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else None
+    if not plan or not isinstance(plan.get("shots"), list):
+        raise ValueError("An approved video plan with shots is required.")
+    webhook = os.getenv("VIDEO_RENDER_WEBHOOK_URL", "").strip()
+    provider = os.getenv("VIDEO_PROVIDER", "adapter").strip() or "adapter"
+    if not webhook:
+        return {
+            "ok": True,
+            "configured": False,
+            "provider": provider,
+            "status": "approved",
+            "dryRun": True,
+            "jobId": "",
+            "outputUrl": "",
+            "message": "Video plan approved. Configure VIDEO_RENDER_WEBHOOK_URL to submit it to Veo, fal.ai/Kling, Runway or another authorized renderer.",
+        }
+    token = os.getenv("VIDEO_RENDER_WEBHOOK_TOKEN", "").strip()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    status_code, response = post_json(webhook, {
+        "source": "clinic-signal-company-video",
+        "provider": provider,
+        "company": payload.get("company", {}),
+        "plan": plan,
+        "referenceAssets": payload.get("referenceAssets", []),
+        "callbackUrl": str(payload.get("callbackUrl", ""))[:500],
+    }, headers, timeout=30)
+    data = response if isinstance(response, dict) else {}
+    return {
+        "ok": True,
+        "configured": True,
+        "provider": provider,
+        "providerStatus": status_code,
+        "status": str(data.get("status", "queued"))[:40],
+        "jobId": str(data.get("jobId", data.get("request_id", data.get("id", ""))))[:300],
+        "outputUrl": safe_public_media_url(data.get("outputUrl", data.get("video_url", ""))),
+        "providerResponse": data,
+        "message": "Video render job submitted to the configured adapter.",
+    }
+
+
+def company_video_render_status(payload: dict):
+    job_id = str(payload.get("jobId", "")).strip()[:300]
+    if not job_id:
+        raise ValueError("Video render jobId is required.")
+    webhook = os.getenv("VIDEO_RENDER_STATUS_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return {"ok": True, "configured": False, "status": "unknown", "jobId": job_id,
+                "message": "Configure VIDEO_RENDER_STATUS_WEBHOOK_URL to refresh provider jobs."}
+    token = os.getenv("VIDEO_RENDER_WEBHOOK_TOKEN", "").strip()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    status_code, response = post_json(webhook, {"jobId": job_id}, headers, timeout=25)
+    data = response if isinstance(response, dict) else {}
+    return {
+        "ok": True,
+        "configured": True,
+        "providerStatus": status_code,
+        "jobId": job_id,
+        "status": str(data.get("status", "unknown"))[:40],
+        "outputUrl": safe_public_media_url(data.get("outputUrl", data.get("video_url", ""))),
+        "error": str(data.get("error", ""))[:1000],
+        "providerResponse": data,
+    }
 
 
 def generate_ai_seo_review(payload: dict):
@@ -1867,15 +2111,18 @@ def export_clinic_candidates(payload: dict):
             if RAQM_AVAILABLE or not re.search(r"[\u0600-\u06FF]", value):
                 return value
             if BIDI_FALLBACK_AVAILABLE:
-                try: return bidi_get_display(arabic_reshaper.reshape(value))
-                except Exception: return value
+                try:
+                    return bidi_get_display(arabic_reshaper.reshape(value))
+                except Exception:
+                    return value
             return value
         def draw_text(draw, xy, value, font, fill, anchor="ra"):
             if RAQM_AVAILABLE:
                 try:
                     draw.text(xy, str(value), font=font, fill=fill, anchor=anchor, direction="rtl", language="fa")
                     return
-                except (ValueError, TypeError, KeyError): pass
+                except (ValueError, TypeError, KeyError):
+                    pass
             draw.text(xy, shape(value), font=font, fill=fill, anchor=anchor)
         pages = []
         per_page = 10
@@ -2030,6 +2277,49 @@ def normalize_exhibitor(row: dict, event: dict):
             "source": "exhibition-import", "resultType": "exhibitor", "verified": False, "raw": mapped}
 
 
+def load_exhibition_candidate_seed(payload: dict):
+    if payload.get("acknowledgeNotCurrentExhibitors") is not True:
+        raise ValueError("Confirm that this historical industry dataset is NOT the official 1405 exhibitor list.")
+    dataset = str(payload.get("dataset", "dowintech-industry-200"))
+    if dataset != "dowintech-industry-200":
+        raise ValueError("Unknown exhibition candidate dataset.")
+    path = ROOT / "data" / "dowintech_industry_candidates_200.csv"
+    if not path.exists():
+        raise ValueError("The candidate seed file is not included in this deployment.")
+    items = []
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        for row in csv.DictReader(stream):
+            items.append({
+                "name": str(row.get("name", ""))[:220],
+                "category": str(row.get("category", ""))[:180],
+                "phone": str(row.get("phone_public", ""))[:100],
+                "phoneSourceStatus": str(row.get("phone_status", ""))[:120],
+                "email": str(row.get("email_public", ""))[:180],
+                "website": "",
+                "websiteVerified": False,
+                "websiteStatus": "not-searched",
+                "websiteMatchScore": 0,
+                "whatsapp": "",
+                "contactConsent": False,
+                "currentExhibitorStatus": "not-confirmed-1405",
+                "participationConfirmed": False,
+                "sourcePeriod": str(row.get("source_period", ""))[:300],
+                "eventName": "هجدهمین نمایشگاه بین‌المللی در و پنجره و صنایع وابسته — هدف تحقیق",
+                "eventDate": "۳۰ تیر تا ۲ مرداد ۱۴۰۵ / 21–24 July 2026",
+                "eventLocation": "محل دائمی نمایشگاه‌های بین‌المللی تهران",
+                "eventSource": "https://titexgroup.com/fa-IR/exhibitions-details/id/5",
+                "source": str(row.get("source_url", ""))[:500],
+                "resultType": "historical-industry-candidate",
+                "verified": False,
+                "recommendedAction": "Confirm 1405 participation, official website and consent before outreach",
+            })
+    for item in items:
+        item["websiteSearchLinks"] = exhibition_company_search_links(item)
+    return {"ok": True, "dataset": dataset, "items": items[:200], "count": min(200, len(items)),
+            "currentExhibitorsConfirmed": False,
+            "disclaimer": "These are 200 public historical/related industry candidates, NOT the official Do-WinTech 1405 exhibitor list. Public landlines are not WhatsApp consent. Verify current participation, website ownership and recipient consent."}
+
+
 def parse_exhibition_data(payload: dict):
     raw = str(payload.get("data", ""))
     if not raw.strip():
@@ -2076,10 +2366,14 @@ def parse_exhibition_data(payload: dict):
                 if not any(cells):
                     continue
                 row = {"company": cells[0]}
-                if len(cells) > 1: row["booth"] = cells[1]
-                if len(cells) > 2: row["category"] = cells[2]
-                if len(cells) > 3: row["phone"] = cells[3]
-                if len(cells) > 4: row["website"] = cells[4]
+                if len(cells) > 1:
+                    row["booth"] = cells[1]
+                if len(cells) > 2:
+                    row["category"] = cells[2]
+                if len(cells) > 3:
+                    row["phone"] = cells[3]
+                if len(cells) > 4:
+                    row["website"] = cells[4]
                 item = normalize_exhibitor(row, event)
                 if item["name"]:
                     items.append(item)
@@ -2088,30 +2382,291 @@ def parse_exhibition_data(payload: dict):
         key = re.sub(r"\W+", "", item["name"].lower())
         if key and key not in seen:
             seen.add(key)
+            item["websiteSearchLinks"] = exhibition_company_search_links(item)
+            item["websiteStatus"] = "provided-unverified" if item.get("website") else "not-searched"
+            item["websiteVerified"] = False
+            item["websiteMatchScore"] = 0
             deduped.append(item)
     return {"ok": True, "items": deduped, "count": len(deduped), "event": event,
             "disclaimer": "Exhibitor data is imported as unverified public-business leads. Confirm identity and contact details before outreach."}
 
 
-def find_company_website_brave(company: str, city: str = ""):
-    key = os.getenv("BRAVE_SEARCH_API_KEY", "")
-    query = f'"{company}" {city} official website وب سایت رسمی'.strip()
-    links = {"google": "https://www.google.com/search?q=" + quote_plus(query),
-             "duckduckgo": "https://duckduckgo.com/?q=" + quote_plus(query),
-             "bing": "https://www.bing.com/search?q=" + quote_plus(query)}
+GENERIC_COMPANY_TOKENS = {
+    "شرکت", "گروه", "صنایع", "تولیدی", "بازرگانی", "مجموعه", "بین", "المللی", "نمایشگاه",
+    "company", "group", "international", "industry", "industries", "official", "website", "co", "ltd",
+}
+EXHIBITION_FAMILIES = {
+    "medical": {"پزشکی", "سلامت", "درمان", "دارو", "بیمارستان", "کلینیک", "medical", "health", "pharma", "clinic", "hospital"},
+    "technology": {"فناوری", "نرم", "افزار", "دیجیتال", "هوش", "رایانه", "technology", "software", "digital", "ai", "it"},
+    "construction": {"ساختمان", "معماری", "پنجره", "درب", "آلومینیوم", "شیشه", "construction", "building", "architecture", "window", "door"},
+    "beauty": {"زیبایی", "پوست", "مو", "آرایشی", "beauty", "aesthetic", "cosmetic", "skin"},
+    "food": {"غذا", "کشاورزی", "بسته", "رستوران", "food", "agriculture", "restaurant", "packaging"},
+    "education": {"آموزش", "دانشگاه", "مدرسه", "education", "university", "school", "training"},
+}
+
+
+def normalize_identity_text(value: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z\u0600-\u06FF]+", " ", str(value or "").lower().translate(DIGIT_TRANSLATION)).strip()
+
+
+def identity_tokens(value: str) -> set[str]:
+    return {token for token in normalize_identity_text(value).split() if len(token) >= 2 and token not in GENERIC_COMPANY_TOKENS}
+
+
+def exhibition_families(value: str) -> set[str]:
+    tokens = identity_tokens(value)
+    normalized = normalize_identity_text(value)
+    return {family for family, words in EXHIBITION_FAMILIES.items()
+            if any(word in tokens or (len(word) > 3 and word in normalized) for word in words)}
+
+
+def exhibition_company_search_links(item: dict) -> dict:
+    name = str(item.get("name", "")).strip()
+    category = str(item.get("category", "")).strip()
+    city = str(item.get("city") or item.get("eventLocation") or "").strip()
+    phone = str(item.get("phone", "")).strip()
+    query = f'"{name}" {category} {city} official website وب سایت رسمی'.strip()
+    links = {
+        "Google": "https://www.google.com/search?q=" + quote_plus(query),
+        "Google Maps": "https://www.google.com/maps/search/?api=1&query=" + quote_plus(f"{name} {city}"),
+        "DuckDuckGo": "https://duckduckgo.com/?q=" + quote_plus(query),
+        "Bing": "https://www.bing.com/search?q=" + quote_plus(query),
+        "Brave": "https://search.brave.com/search?q=" + quote_plus(query),
+        "LinkedIn": "https://www.linkedin.com/search/results/companies/?keywords=" + quote_plus(name),
+    }
+    if phone:
+        links["Google phone"] = "https://www.google.com/search?q=" + quote_plus(f'"{phone}" "{name}"')
+    return links
+
+
+def score_exhibition_website_candidate(item: dict, candidate: dict, html: str = "") -> tuple[int, list[str]]:
+    name = str(item.get("name", ""))
+    category = str(item.get("category", ""))
+    city = str(item.get("city") or item.get("eventLocation") or "")
+    expected_phone = re.sub(r"\D", "", normalize_public_phone(str(item.get("phone", ""))))
+    url = str(candidate.get("website") or candidate.get("url") or "")
+    title = str(candidate.get("name") or candidate.get("title") or "")
+    summary = str(candidate.get("summary") or candidate.get("description") or "")
+    haystack = normalize_identity_text(" ".join((urlparse(url).hostname or "", title, summary, html[:120000])))
+    name_tokens = identity_tokens(name)
+    matched_name = sorted(token for token in name_tokens if token in haystack)
+    evidence = []
+    score = 0
+    if name_tokens:
+        ratio = len(matched_name) / len(name_tokens)
+        score += round(ratio * 50)
+        if matched_name:
+            evidence.append("Name tokens matched: " + ", ".join(matched_name[:8]))
+    candidate_phone = re.sub(r"\D", "", normalize_public_phone(str(candidate.get("phone", ""))))
+    visible_phones = {re.sub(r"\D", "", value) for value in extract_public_phones(html)} if html else set()
+    if expected_phone and (expected_phone == candidate_phone or expected_phone in visible_phones):
+        score += 35
+        evidence.append("Public phone matched exactly")
+    category_tokens = identity_tokens(category)
+    matched_category = sorted(token for token in category_tokens if token in haystack)
+    if category_tokens:
+        score += round(len(matched_category) / len(category_tokens) * 10)
+        if matched_category:
+            evidence.append("Category evidence matched")
+    city_tokens = identity_tokens(city)
+    if city_tokens and any(token in haystack for token in city_tokens):
+        score += 5
+        evidence.append("Location signal matched")
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    if host in {"example.com", "example.org", "example.net"} or host.endswith(".example"):
+        score -= 80
+        evidence.append("Example/test domain rejected")
+    if any(host == blocked or host.endswith("." + blocked) for blocked in
+           ("instagram.com", "linkedin.com", "facebook.com", "wikipedia.org", "paziresh24.com", "nobat.ir")):
+        score -= 35
+        evidence.append("Directory/social profile is not accepted as the official website")
+    return max(0, min(100, score)), evidence
+
+
+def google_places_exhibition_candidates(item: dict) -> list[dict]:
+    key = os.getenv("GOOGLE_PLACES_API_KEY", "").strip() or os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
     if not key:
-        return "", links, "links"
+        return []
+    query = " ".join(str(item.get(field, "")) for field in ("name", "category", "city", "eventLocation")).strip()
+    fields = ",".join(["places.id", "places.displayName", "places.formattedAddress",
+                       "places.nationalPhoneNumber", "places.internationalPhoneNumber",
+                       "places.websiteUri", "places.googleMapsUri", "places.businessStatus"])
+    _, response = post_json("https://places.googleapis.com/v1/places:searchText",
+                            {"textQuery": query, "pageSize": 8, "languageCode": "fa"},
+                            {"X-Goog-Api-Key": key, "X-Goog-FieldMask": fields}, timeout=25)
+    candidates = []
+    for place in (response.get("places", []) if isinstance(response, dict) else [])[:8]:
+        if not isinstance(place, dict) or not place.get("websiteUri"):
+            continue
+        display = place.get("displayName") if isinstance(place.get("displayName"), dict) else {}
+        candidates.append({
+            "name": str(display.get("text", ""))[:180],
+            "website": str(place.get("websiteUri", ""))[:500],
+            "phone": str(place.get("internationalPhoneNumber") or place.get("nationalPhoneNumber") or "")[:100],
+            "address": str(place.get("formattedAddress", ""))[:500],
+            "source": str(place.get("googleMapsUri", ""))[:500],
+            "provider": "google-places",
+        })
+    return candidates
+
+
+def brave_exhibition_candidates(item: dict) -> list[dict]:
+    key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+    if not key:
+        return []
+    query = f'"{item.get("name", "")}" {item.get("phone", "")} {item.get("category", "")} official website'.strip()
     params = urlencode({"q": query, "count": 10, "search_lang": "fa", "safesearch": "strict"})
     _, response = get_json("https://api.search.brave.com/res/v1/web/search?" + params,
                            {"X-Subscription-Token": key})
     results = ((response.get("web") or {}).get("results") or []) if isinstance(response, dict) else []
-    blocked = ("instagram.com", "linkedin.com", "facebook.com", "t.me", "wikipedia.org", "paziresh24.com", "nobat.ir")
-    for result in results:
-        url = str(result.get("url", ""))
-        host = (urlparse(url).hostname or "").lower()
-        if url.startswith("http") and not any(host == b or host.endswith("." + b) for b in blocked):
-            return url, links, "brave"
-    return "", links, "brave"
+    return [{"name": str(result.get("title", ""))[:180],
+             "website": str(result.get("url", ""))[:500],
+             "summary": str(result.get("description", ""))[:600],
+             "source": str(result.get("url", ""))[:500], "provider": "brave"}
+            for result in results[:10] if isinstance(result, dict) and str(result.get("url", "")).startswith("http")]
+
+
+def rank_exhibition_website_candidates(item: dict, candidates: list[dict], verify_top: int = 2) -> list[dict]:
+    unique, seen = [], set()
+    for candidate in candidates:
+        url = str(candidate.get("website") or candidate.get("url") or "").strip()
+        if not url:
+            continue
+        if not urlparse(url).scheme:
+            url = "https://" + url
+        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        candidate = {**candidate, "website": url}
+        score, evidence = score_exhibition_website_candidate(item, candidate)
+        candidate.update({"matchScore": score, "evidence": evidence, "verified": False})
+        unique.append(candidate)
+    unique.sort(key=lambda candidate: candidate["matchScore"], reverse=True)
+    for candidate in unique[:max(0, min(verify_top, 3))]:
+        try:
+            status, final_url, html, content_type, _ = fetch(candidate["website"], timeout=12, limit=1_000_000)
+            if status >= 400 or ("html" not in content_type.lower() and "<html" not in html[:1000].lower()):
+                candidate["evidence"].append(f"Website returned HTTP {status}")
+                continue
+            candidate["website"] = final_url
+            score, evidence = score_exhibition_website_candidate(item, candidate, html)
+            candidate.update({"matchScore": score, "evidence": evidence, "verified": score >= 55})
+            signals = extract_public_contact_signals(html, final_url)
+            candidate["publicPhone"] = signals["phoneNumbers"][0] if signals["phoneNumbers"] else ""
+            candidate["publicEmail"] = signals["emails"][0] if signals["emails"] else ""
+        except Exception as exc:
+            candidate["evidence"].append(f"Website verification failed: {type(exc).__name__}")
+    unique.sort(key=lambda candidate: (candidate.get("verified", False), candidate.get("matchScore", 0)), reverse=True)
+    return unique[:10]
+
+
+def import_exhibition_search_html(payload: dict):
+    company = payload.get("company") if isinstance(payload.get("company"), dict) else {}
+    html = str(payload.get("html", ""))
+    if not company.get("name"):
+        raise ValueError("Target exhibition company is required.")
+    if not html.strip():
+        raise ValueError("Saved search-result HTML is required.")
+    parsed = parse_search_html({"html": html, "engine": payload.get("engine", "generic"),
+                                "sourceUrl": payload.get("sourceUrl", ""),
+                                "specialty": company.get("category", "exhibitor")})
+    candidates = [{"name": item.get("name", ""), "website": item.get("website", ""),
+                   "phone": item.get("phone", ""), "summary": item.get("summary", ""),
+                   "source": item.get("source", ""), "provider": "saved-search-html"}
+                  for item in parsed.get("items", [])]
+    ranked = rank_exhibition_website_candidates(company, candidates, verify_top=1)
+    return {"ok": True, "company": company.get("name"), "candidates": ranked,
+            "count": len(ranked), "searchLinks": exhibition_company_search_links(company),
+            "disclaimer": "Saved search HTML is user-supplied evidence. Candidate websites remain unverified unless identity/phone evidence reaches the verification threshold."}
+
+
+def deterministic_exhibition_validation(event: dict, item: dict, index: int) -> dict:
+    event_text = " ".join(str(event.get(key, "")) for key in ("name", "category", "description", "location"))
+    company_text = " ".join(str(item.get(key, "")) for key in ("name", "category", "tags", "summary"))
+    event_groups = exhibition_families(event_text)
+    company_groups = exhibition_families(company_text)
+    category_tokens = identity_tokens(str(item.get("category", "")))
+    event_tokens = identity_tokens(event_text)
+    lexical_overlap = len(category_tokens & event_tokens)
+    if event_groups and company_groups:
+        related = bool(event_groups & company_groups)
+        relation_score = 88 if related else 20
+        relation_reason = ("Industry family matched: " + ", ".join(sorted(event_groups & company_groups))
+                           if related else "Company industry family does not match the exhibition family")
+    elif lexical_overlap:
+        related = True
+        relation_score = min(85, 55 + lexical_overlap * 10)
+        relation_reason = "Category terms overlap with the exhibition description"
+    else:
+        related = None
+        relation_score = 50
+        relation_reason = "Insufficient category evidence; manual or AI review required"
+    website_score = int(item.get("websiteMatchScore", 0) or 0)
+    website_verified = bool(item.get("websiteVerified", False))
+    return {"index": index, "related": related, "relationScore": relation_score,
+            "relationConfidence": "high" if relation_score >= 80 or relation_score <= 25 else "low",
+            "relationReason": relation_reason, "websiteOfficial": website_verified,
+            "websiteMatchScore": website_score,
+            "websiteReason": "Verified by name/phone/category evidence" if website_verified else
+                             "Website is missing, mismatched or not sufficiently verified",
+            "recommendedAction": "keep" if related is True else "exclude" if related is False else "manual-review"}
+
+
+def analyze_exhibition_relevance(payload: dict):
+    event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    if not items:
+        raise ValueError("Exhibition companies are required for validation.")
+    deterministic = [deterministic_exhibition_validation(event, item, index)
+                     for index, item in enumerate(items[:40]) if isinstance(item, dict)]
+    if not get_gemini_keys():
+        return {"ok": True, "configured": False, "provider": "deterministic",
+                "items": deterministic,
+                "disclaimer": "Gemini is not configured. Relationship and website decisions are conservative deterministic checks and require human review."}
+    evidence = []
+    for index, item in enumerate(items[:40]):
+        if not isinstance(item, dict):
+            continue
+        evidence.append({
+            "index": index, "name": str(item.get("name", ""))[:180],
+            "category": str(item.get("category", ""))[:180], "booth": str(item.get("booth", ""))[:100],
+            "phone": str(item.get("phone", ""))[:100], "website": str(item.get("website", ""))[:500],
+            "websiteMatchScore": item.get("websiteMatchScore"),
+            "websiteVerified": bool(item.get("websiteVerified", False)),
+            "websiteEvidence": item.get("websiteEvidence", [])[:8] if isinstance(item.get("websiteEvidence"), list) else [],
+            "deterministic": deterministic[index] if index < len(deterministic) else {},
+        })
+    prompt = f"""You are validating exhibitors for an exhibition lead database. Return JSON only.
+Event evidence:
+{json.dumps(event, ensure_ascii=False, indent=2)[:5000]}
+Companies and website evidence:
+{json.dumps(evidence, ensure_ascii=False, indent=2)[:20000]}
+
+Rules:
+- Decide relation only from event name/category and company category/name evidence.
+- Never invent products, licenses, revenue, rankings or ownership.
+- A website is official only when the supplied deterministic name/phone/category evidence supports it; do not override a low match merely because the site exists.
+- Mark uncertain cases for manual review.
+- Preserve each index exactly.
+
+Schema:
+{{"items":[{{"index":0,"related":true,"relationScore":0,"relationConfidence":"low|medium|high","relationReason":"string","websiteOfficial":false,"websiteMatchScore":0,"websiteReason":"string","recommendedAction":"keep|exclude|manual-review|find-website"}}]}}
+"""
+    raw, key_number, model = call_gemini(prompt, temperature=0.15, max_tokens=7000)
+    result = parse_ai_json(raw)
+    ai_items = result.get("items") if isinstance(result.get("items"), list) else []
+    clean = []
+    for position, fallback in enumerate(deterministic):
+        result_item = next((value for value in ai_items if isinstance(value, dict) and value.get("index") == fallback["index"]), {})
+        relation_score = max(0, min(100, int(result_item.get("relationScore", fallback["relationScore"]) or 0)))
+        website_score = max(0, min(100, int(result_item.get("websiteMatchScore", fallback["websiteMatchScore"]) or 0)))
+        clean.append({**fallback, **{key: result_item.get(key, fallback.get(key)) for key in
+                     ("related", "relationConfidence", "relationReason", "websiteOfficial", "websiteReason", "recommendedAction")},
+                      "relationScore": relation_score, "websiteMatchScore": website_score, "index": position})
+    return {"ok": True, "configured": True, "provider": "gemini", "model": model,
+            "keyNumber": key_number, "items": clean,
+            "disclaimer": "AI validation is advisory. Human verification of exhibition relevance and official website ownership is required."}
 
 
 def enrich_exhibition_companies(payload: dict):
@@ -2124,41 +2679,71 @@ def enrich_exhibition_companies(payload: dict):
         if not isinstance(item, dict):
             continue
         enriched = dict(item)
-        website = str(enriched.get("website", "")).strip()
-        links = {}
-        discovery_mode = "provided"
-        if not website:
-            website, links, discovery_mode = find_company_website_brave(str(enriched.get("name", "")), str(enriched.get("city", "")))
+        enriched["websiteSearchLinks"] = exhibition_company_search_links(enriched)
+        candidates = []
+        provided = str(enriched.get("website", "")).strip()
+        if provided:
+            candidates.append({"name": "", "website": provided,
+                               "phone": "", "provider": "provided-import"})
+        if isinstance(enriched.get("websiteCandidates"), list):
+            candidates.extend(value for value in enriched["websiteCandidates"] if isinstance(value, dict))
+        provider_errors = []
+        try:
+            candidates.extend(google_places_exhibition_candidates(enriched))
+        except Exception as exc:
+            provider_errors.append(f"Google Places: {type(exc).__name__}")
+        try:
+            candidates.extend(brave_exhibition_candidates(enriched))
+        except Exception as exc:
+            provider_errors.append(f"Brave: {type(exc).__name__}")
+        ranked = rank_exhibition_website_candidates(enriched, candidates, verify_top=2)
+        enriched["websiteCandidates"] = ranked
+        enriched["websiteProviderErrors"] = provider_errors
+        best = ranked[0] if ranked else None
+        if best and best.get("verified"):
+            website = str(best.get("website", ""))
             enriched["website"] = website
-        enriched["websiteSearchLinks"] = links
-        enriched["websiteDiscoveryMode"] = discovery_mode
+            enriched["websiteVerified"] = True
+            enriched["websiteMatchScore"] = int(best.get("matchScore", 0))
+            enriched["websiteEvidence"] = best.get("evidence", [])
+            enriched["websiteDiscoveryMode"] = best.get("provider", "candidate")
+            if best.get("publicPhone") and not enriched.get("phone"):
+                enriched["phone"] = best["publicPhone"]
+            if best.get("publicEmail") and not enriched.get("email"):
+                enriched["email"] = best["publicEmail"]
+        else:
+            if provided:
+                enriched["rejectedWebsite"] = provided
+            enriched["website"] = ""
+            enriched["websiteVerified"] = False
+            enriched["websiteMatchScore"] = int(best.get("matchScore", 0)) if best else 0
+            enriched["websiteEvidence"] = best.get("evidence", []) if best else ["No website candidate found"]
+            enriched["websiteDiscoveryMode"] = best.get("provider", "links") if best else "links"
+        website = str(enriched.get("website", ""))
         if website and run_audit:
             try:
                 report = audit(website)
                 enriched["audit"] = report
                 score = int(report.get("seoScore", 0) or 0)
                 enriched["seoScore"] = score
-                enriched["websiteStatus"] = "working" if report.get("status") == 200 else "error"
-                enriched["opportunityScore"] = max(20, min(95, round((100-score)*0.75 + 25)))
+                enriched["websiteStatus"] = "verified-working" if report.get("status") == 200 else "verified-error"
+                enriched["opportunityScore"] = max(20, min(95, round((100-score) * 0.75 + 25)))
                 enriched["recommendedPackage"] = "Technical SEO Recovery" if score < 50 else "SEO Growth 90 Days" if score < 80 else "Content & CRO Growth"
             except Exception as exc:
-                enriched["websiteStatus"] = "audit-error"
+                enriched["websiteStatus"] = "verified-audit-error"
                 enriched["auditError"] = str(exc)[:300]
                 enriched["opportunityScore"] = 82
                 enriched["recommendedPackage"] = "Website Technical Recovery"
-        elif not website:
-            enriched["websiteStatus"] = "no-website-found"
+        else:
+            enriched["websiteStatus"] = "provided-website-mismatch" if provided else "no-verified-website"
             enriched["seoScore"] = 0
             enriched["opportunityScore"] = 94
-            enriched["recommendedPackage"] = "Website Launch + Local SEO"
-        else:
-            enriched["websiteStatus"] = "website-found"
-            enriched["opportunityScore"] = 60
-            enriched["recommendedPackage"] = "Website Audit Required"
+            enriched["recommendedPackage"] = "Website Verification / Launch + SEO"
         output.append(enriched)
     return {"ok": True, "items": output, "count": len(output),
-            "searchProviderConfigured": bool(os.getenv("BRAVE_SEARCH_API_KEY")),
-            "disclaimer": "Website matches and opportunity scores are unverified sales research. Confirm official ownership before outreach."}
+            "searchProviders": {"googlePlaces": bool(os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY")),
+                                "brave": bool(os.getenv("BRAVE_SEARCH_API_KEY"))},
+            "disclaimer": "Only websites supported by company-name, category and/or exact public-phone evidence are accepted. Low-confidence or example domains are rejected and require human review."}
 
 
 def make_proposal_pdf(payload: dict) -> tuple[bytes, str]:
@@ -2204,8 +2789,12 @@ def make_proposal_pdf(payload: dict) -> tuple[bytes, str]:
         layout = ImageFont.Layout.RAQM if RAQM_AVAILABLE else ImageFont.Layout.BASIC
     else:
         layout = None
-    regular = lambda n: ImageFont.truetype(regular_path, n, layout_engine=layout)
-    bold = lambda n: ImageFont.truetype(bold_path, n, layout_engine=layout)
+    def regular(size):
+        return ImageFont.truetype(regular_path, size, layout_engine=layout)
+
+    def bold(size):
+        return ImageFont.truetype(bold_path, size, layout_engine=layout)
+
     f_small, f_body, f_bold, f_h2, f_title = regular(19), regular(23), bold(23), bold(30), bold(40)
     ink, muted, teal, pale, amber = "#183247", "#64748b", "#00a69c", "#f2f7f9", "#fff7e2"
     left, right = 82, W - 82
@@ -2474,7 +3063,7 @@ class Handler(SimpleHTTPRequestHandler):
         if auth_error:
             status, message = auth_error
             return self.json_response({"ok": False, "error": message}, status)
-        if path not in {"/api/audit", "/api/ai-seo-review", "/api/analyze-clinic-candidates", "/api/send", "/api/vendor-search", "/api/clinic-search", "/api/import-search-html", "/api/enrich-clinics", "/api/scrape-directory", "/api/contact-enrich", "/api/exhibition/import", "/api/exhibition/enrich", "/api/leads/bulk", "/api/export-clinics", "/api/generate-article", "/api/proposal-pdf", "/api/proposal-link"}:
+        if path not in {"/api/audit", "/api/ai-seo-review", "/api/analyze-clinic-candidates", "/api/send", "/api/vendor-search", "/api/clinic-search", "/api/import-search-html", "/api/enrich-clinics", "/api/scrape-directory", "/api/contact-enrich", "/api/video/script", "/api/video/render", "/api/video/status", "/api/exhibition/import", "/api/exhibition/seed-candidates", "/api/exhibition/enrich", "/api/exhibition/search-html", "/api/exhibition/ai-validate", "/api/leads/bulk", "/api/export-clinics", "/api/generate-article", "/api/proposal-pdf", "/api/proposal-link"}:
             return self.json_response({"ok": False, "error": "Not found"}, 404)
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -2525,10 +3114,22 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/contact-enrich":
                 return self.json_response(enrich_public_business_contacts(
                     str(payload.get("url", "")).strip(), int(payload.get("maxPages", 3) or 3)))
+            if path == "/api/video/script":
+                return self.json_response(generate_company_video_plan(payload))
+            if path == "/api/video/render":
+                return self.json_response(submit_company_video_render(payload))
+            if path == "/api/video/status":
+                return self.json_response(company_video_render_status(payload))
             if path == "/api/exhibition/import":
                 return self.json_response(parse_exhibition_data(payload))
+            if path == "/api/exhibition/seed-candidates":
+                return self.json_response(load_exhibition_candidate_seed(payload))
             if path == "/api/exhibition/enrich":
                 return self.json_response(enrich_exhibition_companies(payload))
+            if path == "/api/exhibition/search-html":
+                return self.json_response(import_exhibition_search_html(payload))
+            if path == "/api/exhibition/ai-validate":
+                return self.json_response(analyze_exhibition_relevance(payload))
             if path == "/api/leads/bulk":
                 items = payload.get("items") if isinstance(payload.get("items"), list) else []
                 return self.json_response(persist_leads_database(items))
@@ -2551,8 +3152,12 @@ class Handler(SimpleHTTPRequestHandler):
                      "Clinic enrichment" if path == "/api/enrich-clinics" else
                      "Directory scraper" if path == "/api/scrape-directory" else
                      "Public contact enrichment" if path == "/api/contact-enrich" else
+                     "Company video workflow" if path.startswith("/api/video/") else
                      "Exhibition import" if path == "/api/exhibition/import" else
+                     "Exhibition candidate seed" if path == "/api/exhibition/seed-candidates" else
                      "Exhibition enrichment" if path == "/api/exhibition/enrich" else
+                     "Exhibition search HTML" if path == "/api/exhibition/search-html" else
+                     "Exhibition AI validation" if path == "/api/exhibition/ai-validate" else
                      "Lead database" if path == "/api/leads/bulk" else
                      "Article generation" if path == "/api/generate-article" else
                      "Proposal PDF" if path in {"/api/proposal-pdf", "/api/proposal-link"} else "Audit")

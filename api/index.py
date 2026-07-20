@@ -33,9 +33,15 @@ from server import (  # noqa: E402
     parse_search_html,
     enrich_clinic_candidates,
     enrich_public_business_contacts,
+    generate_company_video_plan,
+    submit_company_video_render,
+    company_video_render_status,
     scrape_clinic_directory,
     parse_exhibition_data,
+    load_exhibition_candidate_seed,
     enrich_exhibition_companies,
+    import_exhibition_search_html,
+    analyze_exhibition_relevance,
     run_configured_discovery,
     persist_leads_database,
     fetch_leads_database,
@@ -205,14 +211,44 @@ def contact_enrich_route():
     ))
 
 
+@app.post("/api/video/script")
+def video_script_route():
+    return jsonify(generate_company_video_plan(json_body()))
+
+
+@app.post("/api/video/render")
+def video_render_route():
+    return jsonify(submit_company_video_render(json_body()))
+
+
+@app.post("/api/video/status")
+def video_status_route():
+    return jsonify(company_video_render_status(json_body()))
+
+
 @app.post("/api/exhibition/import")
 def exhibition_import_route():
     return jsonify(parse_exhibition_data(json_body()))
 
 
+@app.post("/api/exhibition/seed-candidates")
+def exhibition_seed_candidates_route():
+    return jsonify(load_exhibition_candidate_seed(json_body()))
+
+
 @app.post("/api/exhibition/enrich")
 def exhibition_enrich_route():
     return jsonify(enrich_exhibition_companies(json_body()))
+
+
+@app.post("/api/exhibition/search-html")
+def exhibition_search_html_route():
+    return jsonify(import_exhibition_search_html(json_body()))
+
+
+@app.post("/api/exhibition/ai-validate")
+def exhibition_ai_validate_route():
+    return jsonify(analyze_exhibition_relevance(json_body()))
 
 
 @app.get("/api/leads")

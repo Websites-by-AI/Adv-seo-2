@@ -134,10 +134,32 @@ def main():
         assert status == 200 and exhibition["count"] == 2 and exhibition["items"][0]["booth"]
         print("PASS exhibition CSV import and event metadata")
 
+        status, seed_denied = post("/api/exhibition/seed-candidates", {"dataset": "dowintech-industry-200"})
+        assert status == 400 and seed_denied["ok"] is False
+        status, seed = post("/api/exhibition/seed-candidates", {"dataset": "dowintech-industry-200", "acknowledgeNotCurrentExhibitors": True})
+        assert status == 200 and seed["count"] == 200 and seed["currentExhibitorsConfirmed"] is False
+        assert all(item["currentExhibitorStatus"] == "not-confirmed-1405" for item in seed["items"])
+        print("PASS 200 historical industry candidates with explicit not-current-exhibitor labeling")
+
         status, exhibition_enriched = post("/api/exhibition/enrich", {"audit": False, "items": [exhibition["items"][0]]})
-        assert status == 200 and exhibition_enriched["items"][0]["websiteStatus"] == "no-website-found"
-        assert "google" in exhibition_enriched["items"][0]["websiteSearchLinks"]
-        print("PASS exhibition website-search fallback and no-site opportunity")
+        assert status == 200 and exhibition_enriched["items"][0]["websiteStatus"] == "no-verified-website"
+        assert "Google" in exhibition_enriched["items"][0]["websiteSearchLinks"]
+        assert exhibition_enriched["items"][0]["websiteVerified"] is False
+        print("PASS exhibition multi-engine search links and conservative no-site opportunity")
+
+        status, fake_website = post("/api/exhibition/enrich", {"audit": False, "items": [{**exhibition["items"][0], "website": "https://example.com"}]})
+        assert status == 200 and fake_website["items"][0]["websiteVerified"] is False
+        assert fake_website["items"][0]["website"] == "" and fake_website["items"][0]["rejectedWebsite"] == "https://example.com"
+        print("PASS exhibition example/mismatched website rejection")
+
+        saved_html = '<html><body><a class="result__a" href="https://example.com/">Unrelated Example Domain</a></body></html>'
+        status, exhibition_html = post("/api/exhibition/search-html", {"company": exhibition["items"][0], "engine": "duckduckgo", "html": saved_html, "sourceUrl": "https://duckduckgo.com/"})
+        assert status == 200 and exhibition_html["count"] == 1 and exhibition_html["candidates"][0]["verified"] is False
+        print("PASS exhibition saved-search HTML candidate ranking")
+
+        status, exhibition_validation = post("/api/exhibition/ai-validate", {"event": {"name": "نمایشگاه تجهیزات پزشکی"}, "items": exhibition["items"]})
+        assert status == 200 and exhibition_validation["items"][0]["related"] is True
+        print("PASS exhibition relevance and website-evidence validation")
 
         status, no_gemini = post("/api/generate-article", {"language": "fa", "title": "عنوان تست", "outline": "بخش اول\nبخش دوم", "primaryKeyword": "کلمه تست", "targetWordCount": 900})
         assert status == 400 and no_gemini["ok"] is False and "Gemini" in no_gemini["error"]
@@ -146,6 +168,23 @@ def main():
         status, no_ai_review = post("/api/ai-seo-review", {"language": "fa", "audit": {"status": 200, "seoScore": 62, "title": "Clinic", "titleLength": 6, "description": "", "h1Count": 0, "schemaTypes": [], "internalLinks": 5, "robots": True, "sitemap": False, "issues": ["Missing H1"], "wins": ["HTTP 200"]}, "lead": {"name": "کلینیک تست", "scale": "B"}})
         assert status == 400 and "Gemini" in no_ai_review["error"]
         print("PASS AI SEO review evidence input and secret protection")
+
+        status, video_plan = post("/api/video/script", {
+            "company": {"name": "شرکت نمونه", "category": "خدمات دیجیتال", "website": "https://example.com", "tags": ["سئو", "طراحی سایت"]},
+            "language": "fa", "durationSeconds": 45, "objective": "معرفی عمومی شرکت",
+        })
+        assert status == 200 and video_plan["ok"] is True and len(video_plan["plan"]["shots"]) >= 4
+        assert video_plan["plan"]["aspectRatio"] == "16:9"
+        print("PASS factual company-video script/storyboard")
+
+        status, video_denied = post("/api/video/render", {"plan": video_plan["plan"]})
+        assert status == 400 and "approval" in video_denied["error"].lower()
+        status, video_dry_run = post("/api/video/render", {
+            "company": {"name": "شرکت نمونه"}, "plan": video_plan["plan"],
+            "humanApproved": True, "brandRightsConfirmed": True,
+        })
+        assert status == 200 and video_dry_run["configured"] is False and video_dry_run["dryRun"] is True
+        print("PASS company-video approval/rights gate and provider dry run")
 
         if integrations.get("proposalPdfMode") == "direct-download":
             status, content_type, pdf = post_raw("/api/proposal-pdf", {

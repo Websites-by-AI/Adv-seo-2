@@ -1,5 +1,5 @@
 Flask>=3.0,<4
-Pillow>=10.3,<12
+Pillow>=12.3,<13
 requests>=2.32,<3
 arabic-reshaper>=3.0,<4
 python-bidi>=0.6,<1

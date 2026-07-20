@@ -57,7 +57,11 @@ CLINIC_SEARCH_WEBHOOK_URL=... # operator-approved adapter
 
 Google/Bing/DuckDuckGo result pages are not scraped automatically. Saved result HTML can still be imported. Google Places results without an official website are retained as high website-launch opportunities rather than discarded.
 
+Exhibition discovery uses Google, Google Maps, DuckDuckGo, Bing, Brave, LinkedIn and exact-phone search links; official API candidates can come from Google Places or Brave. `POST /api/exhibition/search-html` ranks websites extracted from user-supplied saved search HTML, and `/api/exhibition/ai-validate` checks exhibition relevance plus website evidence. A reachable URL is never accepted as official merely because it loads; low-confidence, directory/social and example domains are rejected.
+
 `POST /api/contact-enrich` extracts public business telephone numbers, email addresses, WhatsApp links/numbers, social links, evidence pages and declared tags from the official website. It can inspect up to 1–5 same-origin contact/about pages, respects `robots.txt` for additional pages, blocks private IPs and never submits forms or accesses accounts. These are public contact signals—not proof of ownership or consent.
+
+The connected company-video workflow uses `POST /api/video/script`, `/api/video/render` and `/api/video/status`. It creates factual 30–60 second 16:9 scripts/storyboards and submits approved projects to a provider-neutral asynchronous webhook. Rendering is disabled until both human review and brand/media-rights confirmation are recorded. Configure `VIDEO_RENDER_WEBHOOK_URL` for a Veo, fal.ai/Kling, Runway or other authorized worker; provider keys remain outside the browser.
 
 Run `SUPABASE_SETUP.sql`, then configure `SUPABASE_URL` and the server-only `SUPABASE_SERVICE_ROLE_KEY`. Discovery results now support **Audit + score + save**; individual audits and Gemini SEO reviews can also be persisted with measured evidence, advisory scores and recommended web/SEO packages in the `raw` JSON column. The service-role key must never use a `NEXT_PUBLIC_` name.
 

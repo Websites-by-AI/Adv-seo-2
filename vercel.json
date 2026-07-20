@@ -9,7 +9,7 @@
   "functions": {
     "api/index.py": {
       "maxDuration": 60,
-      "includeFiles": "{server.py,assets/fonts/**}",
+      "includeFiles": "{server.py,assets/fonts/**,data/**}",
       "excludeFiles": "{public/**,static/**,tests/**,smoke_test.py,sample-proposal-*.pdf,*.zip,__pycache__/**}"
     }
   },
