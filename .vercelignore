@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.zip
+.git/
+.env
+node_modules/
+index.html
+index.source.html
+static/
+build_standalone.py
+Dockerfile
+.dockerignore
+smoke_test.py
+vercel_smoke_test.py
+sample-proposal-*.pdf
+DEPLOYMENT_BLUEPRINT.md

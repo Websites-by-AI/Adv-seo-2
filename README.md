@@ -57,6 +57,8 @@ CLINIC_SEARCH_WEBHOOK_URL=... # operator-approved adapter
 
 Google/Bing/DuckDuckGo result pages are not scraped automatically. Saved result HTML can still be imported. Google Places results without an official website are retained as high website-launch opportunities rather than discarded.
 
+`POST /api/contact-enrich` extracts public business telephone numbers, email addresses, WhatsApp links/numbers, social links, evidence pages and declared tags from the official website. It can inspect up to 1–5 same-origin contact/about pages, respects `robots.txt` for additional pages, blocks private IPs and never submits forms or accesses accounts. These are public contact signals—not proof of ownership or consent.
+
 Run `SUPABASE_SETUP.sql`, then configure `SUPABASE_URL` and the server-only `SUPABASE_SERVICE_ROLE_KEY`. Discovery results now support **Audit + score + save**; individual audits and Gemini SEO reviews can also be persisted with measured evidence, advisory scores and recommended web/SEO packages in the `raw` JSON column. The service-role key must never use a `NEXT_PUBLIC_` name.
 
 ```bash
