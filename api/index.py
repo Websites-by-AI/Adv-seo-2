@@ -38,6 +38,7 @@ from server import (  # noqa: E402
     company_video_render_status,
     scrape_clinic_directory,
     parse_exhibition_data,
+    international_exhibition_sources,
     load_exhibition_candidate_seed,
     enrich_exhibition_companies,
     import_exhibition_search_html,
@@ -249,6 +250,11 @@ def exhibition_search_html_route():
 @app.post("/api/exhibition/ai-validate")
 def exhibition_ai_validate_route():
     return jsonify(analyze_exhibition_relevance(json_body()))
+
+
+@app.get("/api/exhibition/international-sources")
+def exhibition_international_sources_route():
+    return jsonify(international_exhibition_sources())
 
 
 @app.get("/api/leads")

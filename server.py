@@ -652,7 +652,7 @@ def provider_status():
         "soroush": bool(os.getenv("SOROUSH_PARTNER_WEBHOOK_URL")),
         "eitaa": bool(os.getenv("EITAA_APP_TOKEN")),
         "email": bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_FROM")),
-        "sms": bool(os.getenv("SMS_WEBHOOK_URL")),
+        "sms": bool(os.getenv("SMS_WEBHOOK_URL") or twilio_sms_configured()),
         "divar": bool(os.getenv("DIVAR_PARTNER_WEBHOOK_URL")),
     }
     divar_slug = re.sub(r"[^a-zA-Z0-9_-]", "", os.getenv("DIVAR_APP_SLUG", ""))
@@ -663,6 +663,8 @@ def provider_status():
         "sendEnabled": SEND_ENABLED,
         "dryRun": DRY_RUN,
         "providers": providers,
+        "smsProvider": "twilio" if twilio_sms_configured() else "webhook" if os.getenv("SMS_WEBHOOK_URL") else "none",
+        "smsNorthAmericaA2PRegistered": env_flag("SMS_US_A2P_REGISTERED", False),
         "vendorSearchConfigured": bool(os.getenv("VENDOR_SEARCH_WEBHOOK_URL")),
         "clinicSearchConfigured": bool(os.getenv("CLINIC_SEARCH_WEBHOOK_URL") or os.getenv("BRAVE_SEARCH_API_KEY") or os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY")),
         "clinicSearchProviders": {
@@ -705,7 +707,7 @@ def provider_status():
             "soroush": "Uses an operator-authorized Soroush Plus partner webhook.",
             "eitaa": "Uses the Eitaa application sendMessage API; token and permitted chat_id are required.",
             "email": "SMTP credentials remain server-side.",
-            "sms": "Uses an approved provider webhook configured by the operator.",
+            "sms": "Uses Twilio or an approved provider webhook. North American application-to-person messaging requires consent, sender registration and opt-out handling; Google Voice automation is not supported.",
             "divar": "Automatic sending is available only through an authorized Divar partner webhook; no scraping or browser automation.",
         },
     }
@@ -1429,6 +1431,31 @@ def send_email(recipient: str, message: str, subject: str, attachment: bytes | N
     return {"accepted": True}
 
 
+def twilio_sms_configured() -> bool:
+    return bool(os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN") and
+                (os.getenv("TWILIO_FROM_NUMBER") or os.getenv("TWILIO_MESSAGING_SERVICE_SID")))
+
+
+def send_twilio_sms(recipient: str, message: str):
+    sid = os.environ["TWILIO_ACCOUNT_SID"].strip()
+    token = os.environ["TWILIO_AUTH_TOKEN"].strip()
+    data = {"To": recipient, "Body": message}
+    messaging_service = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "").strip()
+    if messaging_service:
+        data["MessagingServiceSid"] = messaging_service
+    else:
+        data["From"] = os.environ["TWILIO_FROM_NUMBER"].strip()
+    response = requests.post(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
+                             data=data, auth=(sid, token), timeout=25)
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1000]}
+    if not response.ok:
+        raise ValueError(f"Twilio SMS HTTP {response.status_code}: {str(body)[:500]}")
+    return response.status_code, body
+
+
 def send_message(payload: dict):
     channel = str(payload.get("channel", "")).lower().strip()
     recipient = str(payload.get("recipient", "")).strip()
@@ -1448,6 +1475,13 @@ def send_message(payload: dict):
         raise ValueError("Authorization to represent the selected sender company is required.")
     if payload.get("doNotContact") is True:
         raise ValueError("Recipient is on the do-not-contact list.")
+    if channel == "sms":
+        normalized_recipient = "+" + re.sub(r"\D", "", recipient) if recipient.strip().startswith("+") else re.sub(r"\D", "", recipient)
+        if len(re.sub(r"\D", "", normalized_recipient)) < 10:
+            raise ValueError("SMS recipient must be a valid E.164-style business contact number.")
+        recipient = normalized_recipient
+        if recipient.startswith("+1") and "STOP" not in message.upper():
+            message = message.rstrip() + "\n\n" + os.getenv("SMS_OPT_OUT_TEXT", "Reply STOP to opt out.")
     rate_limit(channel, recipient)
 
     recipient_hash = hashlib.sha256(recipient.encode("utf-8")).hexdigest()[:16]
@@ -1469,6 +1503,7 @@ def send_message(payload: dict):
         SEND_LOG.appendleft(log)
         return {"ok": True, "sent": False, "dryRun": True, "status": "simulated",
                 "attachmentReady": bool(pdf_bytes), "manualAttachmentRequired": manual_attachment_required,
+                "validatedMessage": message,
                 "message": "Validated successfully. Sending is disabled or DRY_RUN is active."}
 
     if manual_attachment_required:
@@ -1535,10 +1570,18 @@ def send_message(payload: dict):
         response = send_email(recipient, message, subject, pdf_bytes, pdf_filename)
         status = 200
     elif channel == "sms":
-        url = os.environ["SMS_WEBHOOK_URL"]
-        headers = {"Authorization": f"Bearer {os.getenv('SMS_WEBHOOK_TOKEN', '')}"} if os.getenv("SMS_WEBHOOK_TOKEN") else {}
-        status, response = post_json(url, {"to": recipient, "message": message,
-                                            "sender": os.getenv("SMS_SENDER", "")}, headers)
+        if recipient.startswith("+1") and not env_flag("SMS_US_A2P_REGISTERED", False):
+            raise ValueError("North American SMS sending is disabled until SMS_US_A2P_REGISTERED=true and the sender campaign is approved.")
+        provider = os.getenv("SMS_PROVIDER", "twilio" if twilio_sms_configured() else "webhook").strip().lower()
+        if provider == "twilio":
+            if not twilio_sms_configured():
+                raise ValueError("Twilio SMS is not fully configured.")
+            status, response = send_twilio_sms(recipient, message)
+        else:
+            url = os.environ["SMS_WEBHOOK_URL"]
+            headers = {"Authorization": f"Bearer {os.getenv('SMS_WEBHOOK_TOKEN', '')}"} if os.getenv("SMS_WEBHOOK_TOKEN") else {}
+            status, response = post_json(url, {"to": recipient, "message": message,
+                                                "sender": os.getenv("SMS_SENDER", "")}, headers)
     elif channel == "divar":  # Authorized Kenar-e-Divar middleware only
         url = os.environ["DIVAR_PARTNER_WEBHOOK_URL"]
         headers = {"Authorization": f"Bearer {os.getenv('DIVAR_PARTNER_TOKEN', '')}"} if os.getenv("DIVAR_PARTNER_TOKEN") else {}
@@ -2275,6 +2318,15 @@ def normalize_exhibitor(row: dict, event: dict):
             "eventName": str(event.get("name", ""))[:220], "eventDate": str(event.get("date", ""))[:100],
             "eventLocation": str(event.get("location", ""))[:220], "eventSource": str(event.get("source", ""))[:500],
             "source": "exhibition-import", "resultType": "exhibitor", "verified": False, "raw": mapped}
+
+
+def international_exhibition_sources():
+    path = ROOT / "data" / "international_window_exhibition_sources.json"
+    if not path.exists():
+        raise ValueError("International exhibition source registry is missing.")
+    items = json.loads(path.read_text(encoding="utf-8"))
+    return {"ok": True, "items": items, "count": len(items),
+            "disclaimer": "Source registry only. Import and verify public exhibitor evidence; do not infer contacts or send messages without consent."}
 
 
 def load_exhibition_candidate_seed(payload: dict):
@@ -3024,6 +3076,8 @@ class Handler(SimpleHTTPRequestHandler):
                                        "integrationAuth": "verified" if verified else "not-requested"})
         if path == "/api/integrations":
             return self.json_response(provider_status())
+        if path == "/api/exhibition/international-sources":
+            return self.json_response(international_exhibition_sources())
         if path == "/api/send-log":
             return self.json_response({"ok": True, "items": list(SEND_LOG)})
         if path == "/api/leads":

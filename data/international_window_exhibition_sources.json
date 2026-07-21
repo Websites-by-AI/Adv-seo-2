@@ -1,0 +1,47 @@
+[
+  {
+    "country": "Turkey",
+    "event": "Eurasia Window and Door Fair 2026",
+    "status": "official public exhibitor directory",
+    "sourceUrl": "https://www.eurasiawindowdoorfair.com/exhibitor-list",
+    "robotsStatus": "public pages allowed; dashboard/callback/logout excluded",
+    "importMode": "saved-html or approved directory allowlist",
+    "notes": "Official list is paginated; import each saved page and deduplicate."
+  },
+  {
+    "country": "Germany",
+    "event": "FENSTERBAU FRONTALE 2026",
+    "status": "official directory/search; preliminary-list URL may move after event",
+    "sourceUrl": "https://www.frontale.de/en/exhibitors-products/find-exhibitors",
+    "robotsStatus": "public crawling allowed",
+    "importMode": "saved-html or approved directory allowlist",
+    "notes": "Use the official exhibitor finder/search and save filtered results."
+  },
+  {
+    "country": "Sweden",
+    "event": "Nordbygg 2026",
+    "status": "official exhibitor directory",
+    "sourceUrl": "https://exhibit.stockholmsmassan.se/nordbygg/12316?language=eng",
+    "robotsStatus": "robots endpoint returned 404; use saved HTML rather than unattended crawl",
+    "importMode": "saved-html",
+    "notes": "Filter for doors, windows, glass and building-envelope exhibitors."
+  },
+  {
+    "country": "Canada",
+    "event": "WinDoor 2025 / Fenestration Canada",
+    "status": "official event page; no complete structured current list confirmed",
+    "sourceUrl": "https://www.fenestrationcanada.ca/windoor2025",
+    "robotsStatus": "manual review required",
+    "importMode": "saved-html and public exhibitor announcements",
+    "notes": "Do not label historical WinDoor lists as current without official confirmation."
+  },
+  {
+    "country": "United States",
+    "event": "GlassBuild America 2026",
+    "status": "official event/exhibitor-sponsor page",
+    "sourceUrl": "https://www.glassbuildamerica.com/2026-exhibitors-sponsors",
+    "robotsStatus": "manual review required",
+    "importMode": "saved-html or official exported exhibitor PDF",
+    "notes": "Use official Show Floor/exhibitor preview when released; do not substitute attendee lists."
+  }
+]
