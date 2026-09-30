@@ -3,6 +3,7 @@
   "name": "leadfair",
   "compatibility_date": "2026-07-17",
   "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
   "main": ".open-next/worker.js",
   "assets": {
     "directory": ".open-next/assets",
