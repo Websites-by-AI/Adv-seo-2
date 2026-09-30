@@ -102,7 +102,9 @@ export function Dashboard() {
   }, []);
 
   useEffect(() => {
-    load();
+    void (async () => {
+      await load();
+    })();
   }, [load]);
 
   /* ---------- pipeline runner ---------- */

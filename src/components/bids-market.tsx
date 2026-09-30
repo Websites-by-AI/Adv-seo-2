@@ -51,7 +51,9 @@ export function BidsMarket() {
   }, []);
 
   useEffect(() => {
-    load();
+    void (async () => {
+      await load();
+    })();
   }, [load]);
 
   const copyWidgetLink = async (token: string) => {

@@ -32,6 +32,44 @@ Open `http://127.0.0.1:8000`.
 
 Sending is safe by default: `DRY_RUN=true` and `SEND_ENABLED=false`. Every request also requires `consent=true` and `approved=true`.
 
+## Interactive Bale bot
+
+Clinic Signal ships a full interactive bot for the official Bale Bot API. It answers users who
+message the bot first — it never initiates contact:
+
+- `POST /api/bale/webhook` — receives Bale updates (works both on the Docker/local server and the Vercel deployment). Public by design: Bale servers cannot hold the integration token, so protect it with `BALE_WEBHOOK_SECRET` (24+ chars) which is registered via `setWebhook secret_token` and verified on every update (a `?s=` query fallback is also accepted).
+- `POST /api/bale/webhook-setup` `{url?}` / `POST /api/bale/webhook-delete` / `GET /api/bale/webhook-info` — register, remove or inspect the webhook (default: `PUBLIC_BASE_URL/api/bale/webhook`).
+- `GET /api/bale/inbox` — operator view of inbound messages plus opt-in/opt-out counters.
+- Modes: `BALE_BOT_MODE=webhook` (default), `polling` (long-polling `getUpdates` thread, only for long-running hosts such as the HF Space Docker image), or `off`.
+- Commands: `/start` (opt-in), `/help`, `/status`, `پروپوزال`, a website URL → instant SEO audit reply, an Iranian phone number (Persian/Arabic digits supported) → callback request (`persist_leads_database` best-effort), and `ترکیه` / `فراخوانها` / `تأمین` (see below).
+- Compliance: `توقف`/`/stop` opts the chat out (the confirmation is delivered first, then the chat is silenced); opted-out chats also block outbound `/api/send` deliveries on `channel=bale` (do-not-contact enforcement). Bot replies still honor `DRY_RUN`/`SEND_ENABLED` and an anti-flood limiter (5 replies/minute/chat). Opt-in/out state persists to `data/bale_bot_state.json` (in-memory fallback on read-only serverless filesystems).
+
+## Turkey clinic procurement assistant
+
+Maps consumable demand in Turkey (Istanbul focus) across **two markets** and tells you
+WHAT to supply first:
+
+- Markets: `clinics` (10 medical districts, Şişli → Beylikdüzü, 11 consumable categories) and `restaurants` (10 districts — Bağcılar, Esenler, Güngören, Küçükçekmece, Esenyurt, Ümraniye, Pendik, Kartal, Sultanbeyli, Gaziosmanpaşa — × 10 staple raw materials from frying oil and chicken to takeaway packaging).
+- `GET /api/turkey/opportunities?market=clinics|restaurants|all` (default `clinics`) — regions × consumables ranked by consumption (1-5) × indicative margin (%), top picks boosted by live-bid pull, discovery links and regulatory disclaimers.
+- `POST /api/turkey/bids/import` — import bids/RFQs with `{"market": "restaurants", "items":[…]}` (clinic, region, need, quantity, budgetTry, deadline, contact, source) or pipe-separated `text`. Categories and regions are auto-matched (fa/en/tr keywords; ties go to the more specific keyword), duplicates ignored, best-effort Supabase mirror when configured.
+- `POST /api/turkey/bids/sync` — operator-approved `TURKEY_BIDS_WEBHOOK_URL` adapter; safe `configured:false` no-op otherwise. No automatic scraping, matching the project policy.
+- `POST /api/turkey/bids/seed-samples` — (re)seeds **100 deterministic educational restaurant bids** (Şişli-style districts, budgets, deadlines, `+90` contacts — all fictional, `sample:true`). They load automatically at startup; disable with `TURKEY_SEED_SAMPLE_BIDS=false`, resize with `TURKEY_SEED_SAMPLE_COUNT`.
+- Every bid gets `opportunityScore` (0-100, grade A/B/C) = category consumption × margin-mid, boosted by budget size and near deadlines.
+- Compliance: medical regulated categories need TİTCK/ÜTS registration; meat/poultry/dairy supply should carry halal certification and cold chain. Margin figures are advisory, never quotes.
+- Bale bot commands: `ترکیه` (combined map), `فراخوانها` / `تأمین` (clinics), `رستوران ترکیه` / `بید رستوران` / `تأمین رستوران` (restaurants).
+
+## Turkey B2B supplier marketplace (restaurants)
+
+The other side of the Istanbul restaurant market: food suppliers register products with **unit price, stock, minimum order and delivery zones**, restaurants compare offers and build a cheapest-reliable basket — an MVP of a Marketplace + Procurement flow:
+
+- `POST /api/turkey/suppliers/register` — upsert one supplier or `{"suppliers": […]}` bulk (name, region, phone, `deliveryZones`, `products[]` = category/name, priceTry, unit, stock, minOrder, deliveryDays). Category is auto-matched from fa/en/tr keywords when `categoryId` is missing; re-registering the same name+region updates the entry and keeps its rating.
+- `GET /api/turkey/suppliers?market=restaurants` — directory (product counts, categories, rating averages).
+- `GET /api/turkey/compare?category=مرغ&market=restaurants&region=باغجیلار` — one product across suppliers, sorted by price, with min/max/avg/spread stats, delivery-zone flags and a recommendation (a ≥4.5-rated supplier within 8% of the cheapest price is preferred).
+- `POST /api/turkey/smart-plan` — `{"region": "باغجیلار", "needs": [{"category": "مرغ", "qty": 200}, …]}` or free `text` («مرغ 200، روغن 40») → per-line cheapest picks honoring stock caps and minimum orders (with a note when an order is raised to minOrder), grand total, market-average baseline, estimated savings and shortage warnings. Advisory plan from supplier-reported prices — not a binding order.
+- `POST /api/turkey/suppliers/rate` — `{"supplierId": …, "price": 1-5, "quality": 1-5, "delivery": 1-5, "satisfaction": 1-5}`; aggregates into per-aspect and overall averages.
+- Samples: 15 deterministic educational suppliers (`sample:true`, fictional `+90` contacts) covering all 10 staple categories are seeded at startup; disable with `TURKEY_SEED_SAMPLE_SUPPLIERS=false`.
+- Bale bot commands: `تأمین‌کنندگان` (directory), `قیمت مرغ` (price compare), `سبد خرید: مرغ 200، روغن 40` (smart cart).
+
 ## Automatic connection to Adv-seo Next.js
 
 The connected Next.js package calls this Python API server-to-server. Configure the same generated Secret in both deployments:

@@ -1,0 +1,69 @@
+# Deploy the Next.js app ("leadfair") to Cloudflare Workers on every push to master.
+#
+# Required GitHub repository secrets (Settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN   - least-privilege token: Account → Workers Scripts: Write
+#                            (+ Workers KV Storage: Write / R2: Write only if used).
+#                            Do NOT reuse the broad admin token; never paste it in chat.
+#   CLOUDFLARE_ACCOUNT_ID  - your account id (dashboard → Workers → right sidebar).
+# Optional:
+#   DATABASE_URL           - Postgres connection string (Neon/Supabase/...). Stored as a
+#                            Worker secret before deploy. For production latency use
+#                            Cloudflare Hyperdrive and add the binding in wrangler.jsonc
+#                            ("hyperdrive": [{ "binding": "HYPERDRIVE", "id": "..." }]).
+#
+# Run manually anytime: Actions → "Deploy to Cloudflare Workers" → Run workflow.
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "scripts/**"
+      - "drizzle/**"
+      - "package.json"
+      - "package-lock.json"
+      - "wrangler.jsonc"
+      - "open-next.config.ts"
+      - ".github/workflows/deploy-cloudflare.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: cloudflare-deploy
+  cancel-in-progress: false
+
+env:
+  DATABASE_URL_VALUE: ${{ secrets.DATABASE_URL }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies (locked)
+        run: npm ci
+
+      - name: Patch pg driver for the Workers runtime
+        run: node scripts/patch-pg-cloudflare.mjs
+
+      - name: Build the OpenNext worker bundle
+        run: npx @opennextjs/cloudflare build
+
+      - name: Store DATABASE_URL as a Worker secret (if provided)
+        if: ${{ env.DATABASE_URL_VALUE != '' }}
+        run: echo "$DATABASE_URL_VALUE" | npx wrangler secret put DATABASE_URL --name leadfair
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Deploy worker (leadfair)
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

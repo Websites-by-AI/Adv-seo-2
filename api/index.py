@@ -20,8 +20,26 @@ if str(ROOT) not in sys.path:
 from server import (  # noqa: E402
     PILLOW_AVAILABLE,
     SEND_LOG,
+    BALE_BOT_MODE,
+    BALE_INBOX,
+    BALE_WEBHOOK_SECRET,
     integration_auth_error,
     audit,
+    bale_api,
+    bale_bot_enabled,
+    bale_bot_state_summary,
+    bale_process_update,
+    bale_set_webhook,
+    bale_webhook_secret_ok,
+    turkey_bids_import,
+    turkey_bids_sync,
+    turkey_compare_prices,
+    turkey_opportunities,
+    turkey_seed_sample_bids,
+    turkey_smart_plan,
+    turkey_supplier_rate,
+    turkey_suppliers_list,
+    turkey_suppliers_register,
     generate_seo_article,
     generate_ai_seo_review,
     analyze_clinic_candidates_ai,
@@ -250,6 +268,103 @@ def exhibition_search_html_route():
 @app.post("/api/exhibition/ai-validate")
 def exhibition_ai_validate_route():
     return jsonify(analyze_exhibition_relevance(json_body()))
+
+
+@app.post("/api/bale/webhook")
+def bale_webhook_route():
+    if not bale_bot_enabled():
+        return jsonify(ok=False, error="Bale bot is disabled (BALE_BOT_MODE=off)."), 503
+    if not bale_webhook_secret_ok(request.full_path, request.headers):
+        return jsonify(ok=False, error="Invalid Bale webhook secret."), 401
+    return jsonify(bale_process_update(json_body()))
+
+
+@app.post("/api/bale/webhook-setup")
+def bale_webhook_setup_route():
+    data = json_body()
+    base = str(data.get("url", "")).strip() or public_base()
+    status, response = bale_set_webhook(base)
+    return jsonify(ok=status < 400, providerStatus=status, response=response,
+                   webhookUrl=f"{base.rstrip('/')}/api/bale/webhook",
+                   webhookSecretConfigured=bool(BALE_WEBHOOK_SECRET))
+
+
+@app.post("/api/bale/webhook-delete")
+def bale_webhook_delete_route():
+    status, response = bale_api("deleteWebhook", {"drop_pending_updates": False}, timeout=15)
+    return jsonify(ok=status < 400, providerStatus=status, response=response)
+
+
+@app.get("/api/bale/webhook-info")
+def bale_webhook_info_route():
+    status, response = bale_api("getWebhookInfo", {}, timeout=15)
+    return jsonify(ok=status < 400, providerStatus=status, response=response,
+                   **bale_bot_state_summary(), webhookSecretConfigured=bool(BALE_WEBHOOK_SECRET))
+
+
+@app.get("/api/bale/inbox")
+def bale_inbox_route():
+    return jsonify(ok=True, items=list(BALE_INBOX), **bale_bot_state_summary())
+
+
+@app.get("/api/turkey/opportunities")
+def turkey_opportunities_route():
+    market = request.args.get("market", "clinics").strip().lower() or "clinics"
+    try:
+        return jsonify(turkey_opportunities(market))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+
+
+@app.post("/api/turkey/bids/import")
+def turkey_bids_import_route():
+    return jsonify(turkey_bids_import(json_body()))
+
+
+@app.post("/api/turkey/bids/sync")
+def turkey_bids_sync_route():
+    return jsonify(turkey_bids_sync())
+
+
+@app.post("/api/turkey/bids/seed-samples")
+def turkey_bids_seed_samples_route():
+    data = json_body() if request.data else {}
+    return jsonify(turkey_seed_sample_bids(int(data.get("count", 100) or 100)))
+
+
+@app.get("/api/turkey/suppliers")
+def turkey_suppliers_route():
+    market = request.args.get("market", "restaurants").strip().lower() or "restaurants"
+    try:
+        return jsonify(turkey_suppliers_list(market))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+
+
+@app.get("/api/turkey/compare")
+def turkey_compare_route():
+    category = request.args.get("category", request.args.get("q", ""))
+    market = request.args.get("market", "restaurants").strip().lower() or "restaurants"
+    region = (request.args.get("region", "") or "").strip() or None
+    try:
+        return jsonify(turkey_compare_prices(category, market, region))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+
+
+@app.post("/api/turkey/suppliers/register")
+def turkey_suppliers_register_route():
+    return jsonify(turkey_suppliers_register(json_body()))
+
+
+@app.post("/api/turkey/suppliers/rate")
+def turkey_supplier_rate_route():
+    return jsonify(turkey_supplier_rate(json_body()))
+
+
+@app.post("/api/turkey/smart-plan")
+def turkey_smart_plan_route():
+    return jsonify(turkey_smart_plan(json_body()))
 
 
 @app.get("/api/exhibition/international-sources")

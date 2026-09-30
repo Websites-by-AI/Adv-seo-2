@@ -9,3 +9,21 @@ venv/
 .vercel/
 *.zip
 .DS_Store
+
+# Node / Next.js
+node_modules/
+.next/
+.open-next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# Drizzle local artifacts
+drizzle/meta/_journal.json.lock
+
+# Wrangler (Cloudflare)
+.wrangler/
+.dev.vars
+
+# Logs
+*.log

@@ -18,6 +18,7 @@ import socket
 import requests
 from bs4 import BeautifulSoup
 import ssl
+import threading
 import time
 from collections import defaultdict, deque
 from email.message import EmailMessage
@@ -64,7 +65,9 @@ def integration_auth_error(headers, path: str) -> tuple[int, str] | None:
     globally_required = env_flag("CLINIC_SIGNAL_REQUIRE_AUTH", False)
     if not internal_call and not globally_required:
         return None
-    if path in {"/api/shared-pdf"} and not internal_call:
+    # Signed PDF reads must stay link-accessible, and Bale's servers cannot
+    # present the integration token — the bot webhook carries its own secret.
+    if path in {"/api/shared-pdf", "/api/bale/webhook"} and not internal_call:
         return None
 
     expected = os.getenv("CLINIC_SIGNAL_API_TOKEN", "").strip()
@@ -692,6 +695,12 @@ def provider_status():
         "pdfTextEngine": "raqm" if RAQM_AVAILABLE else "arabic-reshaper+bidi" if BIDI_FALLBACK_AVAILABLE else "basic",
         "pdfLinkTtlSeconds": PDF_LINK_TTL,
         "pdfLinksEphemeral": True,
+        "baleBot": {
+            "mode": BALE_BOT_MODE,
+            "tokenConfigured": bool(os.getenv("BALE_BOT_TOKEN", "").strip()),
+            "webhookSecretConfigured": bool(BALE_WEBHOOK_SECRET),
+            "stateFilePersistent": _bale_state_path() is not None,
+        },
         "webApps": {
             "bale": "https://web.bale.ai",
             "rubika": "https://web.rubika.ir",
@@ -1475,6 +1484,8 @@ def send_message(payload: dict):
         raise ValueError("Authorization to represent the selected sender company is required.")
     if payload.get("doNotContact") is True:
         raise ValueError("Recipient is on the do-not-contact list.")
+    if channel == "bale" and bale_is_opted_out(recipient):
+        raise ValueError("Recipient is on the Bale do-not-contact list (they sent STOP to the bot).")
     if channel == "sms":
         normalized_recipient = "+" + re.sub(r"\D", "", recipient) if recipient.strip().startswith("+") else re.sub(r"\D", "", recipient)
         if len(re.sub(r"\D", "", normalized_recipient)) < 10:
@@ -1594,6 +1605,1558 @@ def send_message(payload: dict):
     SEND_LOG.appendleft(log)
     return {"ok": True, "sent": True, "dryRun": False, "status": "sent", "providerStatus": status,
             "providerResponse": response}
+
+
+# ---------------------------------------------------------------------------
+# Interactive Bale bot
+#
+# Receives messages via /api/bale/webhook (recommended) or optional long polling
+# (BALE_BOT_MODE=polling on long-running hosts only, e.g. the HF Space Docker image).
+# Bot replies answer a user-initiated service conversation, so they do NOT require
+# the /api/send outreach approval gates — but they still respect DRY_RUN /
+# SEND_ENABLED, per-chat rate limits, and the do-not-contact (STOP) list.
+# The bot never initiates contact and throttled/silent behaviours are deliberate.
+# ---------------------------------------------------------------------------
+
+BALE_BOT_MODE = os.getenv("BALE_BOT_MODE", "webhook").strip().lower() or "webhook"
+BALE_WEBHOOK_SECRET = os.getenv("BALE_WEBHOOK_SECRET", "").strip()
+BALE_STATE_FILE = os.getenv("BALE_BOT_STATE_FILE", str(ROOT / "data" / "bale_bot_state.json")).strip()
+BALE_STATE_LIMIT = 10_000
+_BALE_STATE: dict = {"optedIn": {}, "optedOut": {}, "updateOffset": 0}
+_BALE_STATE_LOADED = False
+_BALE_STATE_LOCK = threading.Lock()
+BALE_INBOX: deque[dict] = deque(maxlen=200)  # operator view of inbound bot messages
+
+BALE_STOP_WORDS = {"stop", "/stop", "unsubscribe", "cancel", "توقف", "لغو", "لغو پیام", "لغوپیام", "پایان"}
+BALE_START_WORDS = {"/start", "start", "شروع"}
+BALE_HELP_WORDS = {"/help", "help", "راهنما", "کمک"}
+BALE_STATUS_WORDS = {"/status", "وضعیت"}
+BALE_PROPOSAL_WORDS = {"پروپوزال", "پیشنهاد", "قیمت", "pdf", "/proposal"}
+BALE_TURKEY_WORDS = {"ترکیه", "تورکیه", "تورکيه", "istanbul", "استانبول", "/turkey"}
+BALE_TURKEY_BIDS_WORDS = {"فراخوان", "فراخوانها", "بید", "بیدها", "مناقصه", "/bids", "/turkey-bids"}
+BALE_TURKEY_SUPPLY_WORDS = {"تأمین", "تامین", "سود تامین", "سود تأمین", "/supply"}
+BALE_URL_PATTERN = re.compile(
+    r"(?i)(?:https?://[^\s<>\"'\u200c]+|(?:www\.)?[a-z0-9][a-z0-9-]{0,62}(?:\.[a-z0-9][a-z0-9-]{0,62})+(?:/[^\s<>\"'\u200c]*)?)")
+
+
+def bale_bot_enabled() -> bool:
+    return BALE_BOT_MODE in {"webhook", "polling"}
+
+
+def bale_bot_state_summary() -> dict:
+    _bale_load_state()
+    return {"optedIn": len(_BALE_STATE["optedIn"]), "optedOut": len(_BALE_STATE["optedOut"]),
+            "mode": BALE_BOT_MODE, "updateOffset": int(_BALE_STATE.get("updateOffset") or 0)}
+
+
+def _bale_state_path() -> Path | None:
+    if not BALE_STATE_FILE:
+        return None
+    try:
+        path = Path(BALE_STATE_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+    except Exception:
+        return None
+
+
+def _bale_load_state():
+    global _BALE_STATE_LOADED
+    with _BALE_STATE_LOCK:
+        if _BALE_STATE_LOADED:
+            return
+        _BALE_STATE_LOADED = True
+        path = _bale_state_path()
+        if path and path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    for key in ("optedIn", "optedOut"):
+                        if isinstance(data.get(key), dict):
+                            _BALE_STATE[key] = {str(k): v for k, v in data[key].items()
+                                                if isinstance(v, dict)}
+                    _BALE_STATE["updateOffset"] = int(data.get("updateOffset", 0) or 0)
+            except Exception:
+                pass  # A corrupt state file must never take the bot down.
+
+
+def _bale_save_state():
+    path = _bale_state_path()
+    if not path:
+        return
+    try:
+        payload = {**_BALE_STATE, "savedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass  # Read-only filesystems (serverless) simply keep in-memory state.
+
+
+def _bale_state_set(map_name: str, chat_id: str, record: dict | None):
+    _bale_load_state()
+    with _BALE_STATE_LOCK:
+        bucket = _BALE_STATE[map_name]
+        if record is None:
+            bucket.pop(chat_id, None)
+        else:
+            if len(bucket) >= BALE_STATE_LIMIT:
+                oldest = sorted(bucket, key=lambda k: str(bucket[k].get("at", "")))[:512]
+                for key in oldest:
+                    bucket.pop(key, None)
+            bucket[chat_id] = record
+        _bale_save_state()
+
+
+def bale_is_opted_out(chat_id) -> bool:
+    _bale_load_state()
+    return str(chat_id).strip() in _BALE_STATE["optedOut"]
+
+
+def bale_opt_in(chat_id, name: str = "", username: str = "") -> dict:
+    chat_id = str(chat_id).strip()
+    _bale_load_state()
+    returning = chat_id in _BALE_STATE["optedIn"] or chat_id in _BALE_STATE["optedOut"]
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _bale_state_set("optedOut", chat_id, None)
+    _bale_state_set("optedIn", chat_id, {"at": now, "name": str(name)[:80], "username": str(username)[:80]})
+    return {"optedIn": True, "returning": returning}
+
+
+def bale_opt_out(chat_id) -> dict:
+    chat_id = str(chat_id).strip()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _bale_state_set("optedIn", chat_id, None)
+    _bale_state_set("optedOut", chat_id, {"at": now})
+    return {"optedOut": True}
+
+
+def bale_api(method: str, payload: dict | None = None, timeout: int = 20):
+    token = os.getenv("BALE_BOT_TOKEN", "").strip()
+    if not token:
+        raise ValueError("BALE_BOT_TOKEN is not configured. Create the bot inside Bale and store the token as a hosting secret.")
+    return post_json(f"https://tapi.bale.ai/bot{token}/{method}", payload or {}, timeout=timeout)
+
+
+def bale_reply(chat_id, text: str) -> dict:
+    """Reply to a user-initiated bot conversation. Respects STOP list, rate limits
+    and the global DRY_RUN/SEND_ENABLED safety switches."""
+    chat_id = str(chat_id).strip()
+    if not re.fullmatch(r"-?\d{3,20}", chat_id):
+        raise ValueError("Invalid Bale chat id.")
+    if bale_is_opted_out(chat_id):
+        return {"ok": False, "sent": False, "skipped": "opted-out"}
+    rate_limit("bale", chat_id)
+    recipient_hash = hashlib.sha256(chat_id.encode("utf-8")).hexdigest()[:16]
+    log = {"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "channel": "bale",
+           "recipientHash": recipient_hash, "leadId": "", "via": "bot-reply", "attachment": False}
+    if DRY_RUN or not SEND_ENABLED:
+        log["status"] = "simulated"
+        SEND_LOG.appendleft(log)
+        return {"ok": True, "sent": False, "dryRun": True, "status": "simulated"}
+    status, response = bale_api("sendMessage", {"chat_id": int(chat_id), "text": text[:4000]}, timeout=20)
+    log["status"] = "sent" if status < 400 else f"http-{status}"
+    SEND_LOG.appendleft(log)
+    return {"ok": status < 400, "sent": status < 400, "dryRun": False,
+            "status": "sent" if status < 400 else "failed", "providerStatus": status, "providerResponse": response}
+
+
+def _bale_normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text.translate(DIGIT_TRANSLATION)).strip().lower().replace("ي", "ی").replace("ك", "ک")
+
+
+def _bale_extract_phone(text: str) -> str | None:
+    for candidate in re.findall(r"(?:\+?98|0)?[\d\s\-()]{9,16}", text):
+        digits = re.sub(r"\D", "", candidate)
+        if re.fullmatch(r"9\d{9}", digits):
+            return "0" + digits
+        if re.fullmatch(r"989\d{9}", digits):
+            return "0" + digits[2:]
+        if re.fullmatch(r"0\d{10}", digits):
+            return digits
+    return None
+
+
+def _bale_extract_url(text: str) -> str | None:
+    match = BALE_URL_PATTERN.search(text)
+    if not match:
+        return None
+    candidate = match.group(0).rstrip(").،؛!؟")
+    host = urlparse(candidate if "://" in candidate else "https://" + candidate).hostname or ""
+    return candidate if "." in host else None
+
+
+def bale_set_webhook(base_url: str):
+    base = base_url.strip().rstrip("/")
+    if not base.startswith(("https://", "http://")):
+        raise ValueError("A public base URL is required (set PUBLIC_BASE_URL or pass an explicit url).")
+    payload = {"url": f"{base}/api/bale/webhook", "allowed_updates": ["message"]}
+    if BALE_WEBHOOK_SECRET:
+        # Telegram-compatible: Bale echoes this back via the X-Bale-Bot-Api-Secret-Token header.
+        payload["secret_token"] = BALE_WEBHOOK_SECRET
+    return bale_api("setWebhook", payload, timeout=30)
+
+
+def bale_webhook_secret_ok(raw_target: str, headers) -> bool:
+    if not BALE_WEBHOOK_SECRET:
+        return True
+    provided = parse_qs(urlparse(raw_target).query).get("s", [""])[0]
+    candidates = [provided]
+    if headers is not None:
+        candidates.append(str(headers.get("X-Bale-Bot-Api-Secret-Token", "")))
+        candidates.append(str(headers.get("X-Telegram-Bot-Api-Secret-Token", "")))
+    return any(c and hmac.compare_digest(c, BALE_WEBHOOK_SECRET) for c in candidates)
+
+
+BALE_WELCOME_BODY = (
+    "این ربات برای پاسخ‌گویی سریع به صاحبان کسب‌وکار فعال است.\n\n"
+    "دستورهای موجود:\n"
+    "• ارسال آدرس وب‌سایت ← ممیزی فوری سئو و دریافت امتیاز\n"
+    "• ارسال شماره تماس ← ثبت درخواست تماس کارشناس\n"
+    "• «پروپوزال» ← نحوه دریافت پیشنهاد همکاری\n"
+    "• «ترکیه» ← فرصت‌های تأمین کلینیک‌های ترکیه\n"
+    "• /status ← وضعیت اشتراک شما\n"
+    "• /stop ← توقف کامل دریافت پیام\n\n"
+    "پیام شما فقط برای پاسخ به همین گفت‌وگو استفاده می‌شود و بدون رضایت شما هیچ پیام تبلیغاتی ارسال نمی‌کنیم.")
+BALE_HELP_BODY = ("کافی است آدرس وب‌سایت کسب‌وکارتان را بفرستید تا امتیاز و مهم‌ترین مشکلات سئوی آن را همین‌جا ببینید. "
+                  "برای درخواست تماس کارشناس، شماره موبایل یا تلفن ثابت خود را بفرستید. "
+                  "بازار ترکیه: «ترکیه» — مقایسه قیمت تأمین‌کنندگان: «قیمت مرغ» — برنامه خرید هوشمند: «سبد خرید: مرغ 200، روغن 40». "
+                  "برای توقف دریافت پیام: /stop")
+BALE_PROPOSAL_BODY = ("پیشنهادهای همکاری پس از بررسی انسانی، ثبت رضایت و تأیید نهایی توسط کارشناس ما ارسال می‌شود؛ "
+                      "ربات به‌تنهایی پیشنهاد قیمت صادر نمی‌کند. اگر وب‌سایت یا شماره تماس خود را بفرستید وارد فرایند بررسی می‌شوید. "
+                      "لینک PDF پیشنهادها موقت، امضاشده و غیرقابل پیش‌بینی است.")
+
+
+def bale_process_update(update: dict):
+    """Handle one Bale Bot API update object. Returns an action summary; the same
+    summary is the webhook HTTP response body."""
+    if not isinstance(update, dict):
+        raise ValueError("Invalid update payload.")
+    message = update.get("message") or update.get("edited_message")
+    if not isinstance(message, dict) or not message:
+        return {"ok": True, "ignored": True, "reason": "no-message"}
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    chat_id = str(chat.get("id", "")).strip()
+    if not chat_id:
+        return {"ok": True, "ignored": True, "reason": "no-chat"}
+    sender = message.get("from") if isinstance(message.get("from"), dict) else {}
+    name = " ".join(x for x in [str(sender.get("first_name", "")).strip(), str(sender.get("last_name", "")).strip()] if x).strip()
+    name = name[:80] or str(sender.get("username", ""))[:80] or "کاربر"
+    username = str(sender.get("username", ""))[:80]
+    text = str(message.get("text", "") or "").strip()
+    normalized = _bale_normalize(text)
+    actions: list[dict] = []
+    kind = "text"
+
+    def record():
+        BALE_INBOX.appendleft({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                               "chatId": chat_id, "name": name, "username": username,
+                               "text": text[:300], "kind": kind})
+
+    def reply(body: str):
+        result = bale_reply(chat_id, body)
+        actions.append({"type": "reply", "status": result.get("status") or result.get("skipped", "?"),
+                        "dryRun": result.get("dryRun", False), "chars": len(body),
+                        "preview": body[:160]})  # bot-generated text; lets operators verify behaviour
+        return result
+
+    if not text:
+        return {"ok": True, "ignored": True, "reason": "empty-text"}
+
+    # STOP always works — even when already opted out or the bot is disabled.
+    if normalized in BALE_STOP_WORDS:
+        kind = "stop"
+        record()
+        reply("✅ دریافت پیام برای شما غیرفعال شد؛ دیگر هیچ پیامی از این ربات نمی‌گیرید. برای شروع دوباره کافی است /start را بفرستید.")
+        bale_opt_out(chat_id)  # opt out AFTER the confirmation reply, or it would be self-blocked
+        return {"ok": True, "actions": actions, "optedOut": True}
+
+    # /start re-activates a previously stopped conversation.
+    if normalized in BALE_START_WORDS:
+        kind = "start"
+        if not bale_bot_enabled():
+            return {"ok": False, "error": "Bale bot is disabled (BALE_BOT_MODE=off)."}
+        state = bale_opt_in(chat_id, name, username)
+        record()
+        reply(f"سلام {name} عزیز 👋 به ربات «سیگنال کلینیک» خوش آمدید.\n\n" + BALE_WELCOME_BODY)
+        return {"ok": True, "actions": actions, "optedIn": True, "returning": state.get("returning", False)}
+
+    # Opted-out conversations stay silent (compliance: no messaging after STOP).
+    if bale_is_opted_out(chat_id):
+        record()
+        return {"ok": True, "actions": [{"type": "silenced", "reason": "opted-out"}], "optedOut": True}
+
+    if not bale_bot_enabled():
+        return {"ok": False, "error": "Bale bot is disabled (BALE_BOT_MODE=off)."}
+
+    try:
+        if normalized in BALE_HELP_WORDS:
+            kind = "help"
+            record()
+            reply(BALE_HELP_BODY)
+            return {"ok": True, "actions": actions}
+
+        if normalized in BALE_STATUS_WORDS:
+            kind = "status"
+            summary = bale_bot_state_summary()
+            send_state = "فعال (ارسال واقعی)" if (SEND_ENABLED and not DRY_RUN) else "شبیه‌سازی (Dry Run)"
+            _bale_load_state()
+            sub_state = "مشترک ✅" if chat_id in _BALE_STATE["optedIn"] else "ثبت‌نام نشده (برای شروع: /start)"
+            record()
+            reply(f"وضعیت اشتراک شما: {sub_state}\nحالت ارسال سرویس: {send_state}\nکاربران متصل: {summary['optedIn']} · لغوشده: {summary['optedOut']}")
+            return {"ok": True, "actions": actions}
+
+        if normalized in BALE_PROPOSAL_WORDS:
+            kind = "proposal"
+            record()
+            reply(BALE_PROPOSAL_BODY)
+            return {"ok": True, "actions": actions}
+
+        if normalized in BALE_TURKEY_WORDS:
+            kind = "turkey"
+            record()
+            clinics = turkey_opportunities("clinics")
+            resto = turkey_opportunities("restaurants")
+            reply("🇹🇷 نقشه فرصت‌های تأمین ترکیه (استانبول)\n"
+                  f"🏥 کلینیک‌ها: {clinics['summary']['regionCount']} منطقه · {clinics['summary']['consumableCategories']} دسته ملزومات · {clinics['summary']['activeBids']} بید\n"
+                  f"🍽 رستوران‌ها: {resto['summary']['regionCount']} منطقه (باغجیلار و...) · {resto['summary']['consumableCategories']} ماده اولیه · {resto['summary']['activeBids']} بید (نمونه آموزشی)\n\n"
+                  "دستورها:\n"
+                  "• «فراخوانها» ← بیدهای کلینیک‌ها · «بید رستوران» ← بیدهای رستوران‌ها\n"
+                  "• «تأمین» ← پیشنهاد تأمین کلینیک · «تأمین رستوران» ← پیشنهاد مواد اولیه رستوران\n"
+                  "• «رستوران ترکیه» ← نمای کلی بازار غذا · «تأمین‌کنندگان» ← پنل تأمین‌کننده‌ها\n"
+                  "• «قیمت مرغ» ← مقایسه قیمت · «سبد خرید: مرغ 200، روغن 40» ← برنامه خرید هوشمند")
+            return {"ok": True, "actions": actions}
+
+        # Turkey B2B supplier marketplace: directory, price compare, smart cart.
+        if any(k in normalized for k in ("تامین‌کن", "تأمین‌کن", "تامین کن", "تأمین کن", "supplier", "/suppliers")):
+            kind = "turkey-suppliers"
+            record()
+            data = turkey_suppliers_list("restaurants")
+            rows = sorted(data["suppliers"], key=lambda s: (-(s["ratingAvg"] or 0), -s["productCount"]))[:6]
+            lines = []
+            for i, s in enumerate(rows, 1):
+                stars = f"⭐ {s['ratingAvg']}/۵ ({s['ratingCount']} رأی)" if s["ratingAvg"] else "بدون امتیاز"
+                lines.append(f"{i}) {s['name'][:34]} · {s['regionFa']}\n{s['productCount']} محصول · {stars} · 📞 {s['phone'] or '—'}")
+            note = " (شامل نمونه‌های آموزشی با تماس ساختگی)" if data.get("samplesNote") else ""
+            reply("🏪 تأمین‌کنندگان مواد غذایی رستوران‌های استانبول:\n\n" + "\n".join(lines) +
+                  f"\n\nمجموع {data['count']} تأمین‌کننده{note} — فهرست کامل: GET /api/turkey/suppliers\n"
+                  "💲 مقایسه قیمت: «قیمت مرغ» · 🛒 برنامه خرید: «سبد خرید: مرغ 200، روغن 40»")
+            return {"ok": True, "actions": actions}
+
+        if normalized.startswith(("قیمت ", "/price")) and len(normalized) >= 6:
+            kind = "turkey-compare"
+            record()
+            cat_text = (normalized[5:] if normalized.startswith("قیمت ") else normalized[6:]).strip(" :،,")
+            try:
+                cmp_data = turkey_compare_prices(cat_text, "restaurants")
+            except ValueError:
+                reply(f"دسته‌ای مطابق «{cat_text[:30]}» پیدا نشد. مثال: «قیمت مرغ»، «قیمت روغن»، «قیمت برنج»، «قیمت گوشت»، «قیمت سبزیجات».")
+                return {"ok": True, "actions": actions}
+            if not cmp_data["offers"]:
+                reply(f"برای «{cmp_data['category']['fa']}» هنوز تأمین‌کننده‌ای قیمت ثبت نکرده است.")
+                return {"ok": True, "actions": actions}
+            lines = []
+            for i, o in enumerate(cmp_data["offers"][:4], 1):
+                stars = f" · ⭐{o['ratingAvg']}" if o["ratingAvg"] else ""
+                zone = "" if o["deliversHere"] else " · ⛔ محدوده تحویل محدود"
+                lines.append(f"{i}) {o['supplier'][:30]} — {o['priceTry']:,.1f} لیر/{o['unit']} · حداقل {o['minOrder']} · تحویل {o['deliveryDays']} روز{stars}{zone}")
+            st = cmp_data["stats"]
+            reco = cmp_data.get("recommendation")
+            reco_line = f"\n⭐ پیشنهاد: {reco['supplier'][:30]} ({reco['reason']})" if reco else ""
+            reply(f"💲 مقایسه قیمت «{cmp_data['category']['fa'].split(' (')[0]}» بین {st['offerCount']} تأمین‌کننده:\n\n" + "\n".join(lines) +
+                  f"\n\nکف {st['min']:,.0f} · سقف {st['max']:,.0f} · میانگین {st['avg']:,.0f} لیر (پراکندگی {st['spreadPct']}٪)" + reco_line +
+                  "\n\nقیمت‌ها اعلامی تأمین‌کنندگان‌اند و ممکن است نمونه آموزشی باشند؛ قبل از سفارش تأیید کنید. جزئیات: GET /api/turkey/compare?category=" + cmp_data["category"]["id"])
+            return {"ok": True, "actions": actions}
+
+        if normalized.startswith(("سبد خرید", "خرید هوشمند", "/cart", "سبد")):
+            kind = "turkey-cart"
+            record()
+            rest = normalized
+            for prefix in ("سبد خرید", "خرید هوشمند", "/cart", "سبد"):
+                if rest.startswith(prefix):
+                    rest = rest[len(prefix):].strip(" :،,")
+                    break
+            try:
+                plan = turkey_smart_plan({"market": "restaurants", "text": rest})
+            except ValueError:
+                reply("لیست خرید را با مقدار بنویسید؛ مثلاً:\n«سبد خرید: مرغ 200، روغن 40، برنج 150»\nربات برای هر قلم ارزان‌ترین تأمین‌کننده مناسب را پیشنهاد می‌دهد.")
+                return {"ok": True, "actions": actions}
+            lines = []
+            for line in plan["lines"][:6]:
+                for p in line["picks"][:2]:
+                    note = f" ⚠️{p['note']}" if p.get("note") else ""
+                    lines.append(f"• {line['categoryFa'].split(' (')[0]}: {p['qty']} {p['unit']} از {p['supplier'][:28]} — {p['lineTotal']:,.0f} لیر{note}")
+            t = plan["totals"]
+            saving = t["estimatedSavingsVsAvg"]
+            saving_txt = (f"صرفه‌جویی ~{abs(saving):,.0f} لیر نسبت به میانگین بازار" if saving >= 0
+                          else f"~{abs(saving):,.0f} لیر بالاتر از میانگین (به‌خاطر حداقل سفارش)")
+            warn = ("\n⚠️ " + "\n⚠️ ".join(plan["warnings"][:2])) if plan["warnings"] else ""
+            reply("🛒 برنامه خرید هوشمند (ارزان‌ترین تأمین‌کننده برای هر قلم):\n\n" + "\n".join(lines) +
+                  f"\n\nجمع کل: {t['grandTotal']:,.0f} لیر · میانگین بازار: {t['avgMarketTotal']:,.0f} لیر · {saving_txt}" + warn +
+                  "\n\nاین پیشنهاد برنامه‌ریزی بر اساس قیمت‌های اعلامی (شامل نمونه آموزشی با تماس ساختگی) است، نه سفارش قطعاتی. API: POST /api/turkey/smart-plan")
+            return {"ok": True, "actions": actions}
+
+        is_restaurant = "رستوران" in normalized
+        has_bid_key = any(k in normalized for k in ("فراخوان", "بید", "مناقصه"))
+        has_supply_key = any(k in normalized for k in ("تأمین", "تامین"))
+
+        if is_restaurant and has_supply_key:
+            kind = "turkey-restaurant-supply"
+            record()
+            opp = turkey_opportunities("restaurants")
+            lines = []
+            for i, c in enumerate(opp["topPicks"][:6], 1):
+                flag = f" ⚠️{c['certNote']}" if c.get("certNote") else ""
+                pull = f" · {c['activeBids']} بید فعال" if c["activeBids"] else ""
+                lines.append(f"{i}) {c['fa']} — مصرف {c['consumption']}/۵ · حاشیه ~{c['margin'][0]}-{c['margin'][1]}٪{pull}{flag}")
+            reply("🧭 پیشنهاد تأمین مواد اولیه رستوران‌های استانبول (مصرف × سود):\n\n" + "\n".join(lines) +
+                  "\n\nتوضیح: ارقام تقریبی برای اولویت‌بندی‌اند؛ برای گوشت/مرغ/لبنیات گواهی حلال و زنجیره سرد را لحاظ کنید.")
+            return {"ok": True, "actions": actions}
+
+        if is_restaurant and has_bid_key:
+            kind = "turkey-restaurant-bids"
+            record()
+            scored = sorted((turkey_score_bid(b) for b in TURKEY_BIDS if b["market"] == "restaurants"),
+                            key=lambda b: -b["opportunityScore"])[:3]
+            if not scored:
+                reply("بیدی برای رستوران‌ها ثبت نشده است. با POST /api/turkey/bids/seed-samples صد بید نمونه بارگذاری کنید یا با POST /api/turkey/bids/import وارد کنید.")
+            else:
+                blocks = []
+                for i, b in enumerate(scored, 1):
+                    blocks.append(f"{i}) 🍽 {b['clinic'][:40]} · {b['regionFa']}\nنیاز: {b['need'][:80]}\n"
+                                  f"امتیاز: {b['opportunityScore']}/۱۰۰ ({b['grade']}) · تعداد {b.get('quantity') or '—'} · بودجه ~{int(b.get('budgetTry') or 0):,} لیر · ددلاین {b.get('deadline') or '—'}\n"
+                                  f"📞 {b.get('contact') or '—'}")
+                reply("📋 داغ‌ترین بیدهای رستوران‌های استانبول:\n\n" + "\n\n".join(blocks) +
+                      f"\n\nمجموع {sum(1 for b in TURKEY_BIDS if b['market']=='restaurants')} بید (نمونه آموزشی با تماس ساختگی) — فهرست کامل: GET /api/turkey/opportunities?market=restaurants")
+            return {"ok": True, "actions": actions}
+
+        if is_restaurant:
+            kind = "turkey-restaurant"
+            record()
+            opp = turkey_opportunities("restaurants")
+            top_regions = "، ".join(r["fa"] for r in opp["regions"][:5])
+            reply("🍽 بازار رستوران‌های استانبول در ۱۰ منطقه\n"
+                  f"• مناطق داغ: {top_regions} و...\n"
+                  f"• ۱۰ ماده اولیه اصلی از روغن و مرغ تا بسته‌بندی تحلیل می‌شود\n"
+                  f"• بیدهای ثبت‌شده: {opp['summary']['activeBids']} (نمونه آموزشی با تماس ساختگی)\n\n"
+                  "دستورها: «بید رستوران» ← داغ‌ترین بیدها با تماس · «تأمین رستوران» ← اولویت تأمین بر اساس مصرف × سود")
+            return {"ok": True, "actions": actions}
+
+        if normalized in BALE_TURKEY_BIDS_WORDS:
+            kind = "turkey-bids"
+            record()
+            scored = sorted((turkey_score_bid(b) for b in TURKEY_BIDS if b["market"] == "clinics"),
+                            key=lambda b: -b["opportunityScore"])[:3]
+            if not scored:
+                reply("هنوز فراخوانی ثبت نشده است. اپراتور می‌تواند از طریق POST /api/turkey/bids/import (آیتم یا متن پایپ‌جدا) یا وب‌هوک رسمی TURKEY_BIDS_WEBHOOK_URL بیدها را وارد کند； "
+                      "لینک‌های کشف (EKAP و ...) در GET /api/turkey/opportunities موجود است.")
+            else:
+                blocks = []
+                for i, b in enumerate(scored, 1):
+                    extra = []
+                    if b.get("quantity"):
+                        extra.append(f"تعداد {b['quantity']}")
+                    if b.get("budgetTry"):
+                        extra.append(f"بودجه ~{int(b['budgetTry']):,} لیر")
+                    if b.get("deadline"):
+                        extra.append(f"ددلاین {b['deadline'][:10]}")
+                    blocks.append(f"{i}) 🏥 {b['clinic']} · {b['regionFa']}\nنیاز: {b['need'][:90]}\n"
+                                  f"امتیاز فرصت: {b['opportunityScore']}/۱۰۰ (درجه {b['grade']}) · مصرف {b['consumptionLevel']}/۵ · حاشیه ~{b['marginRange'][0]}-{b['marginRange'][1]}٪"
+                                  + ("\n" + " · ".join(extra) if extra else ""))
+                reply("📋 مهم‌ترین بیدهای کلینیک‌های ترکیه:\n\n" + "\n\n".join(blocks) +
+                      f"\n\nمجموع {sum(1 for b in TURKEY_BIDS if b['market']=='clinics')} بید کلینیکی در سیستم — فهرست کامل: GET /api/turkey/opportunities · برای رستوران‌ها: «بید رستوران»")
+            return {"ok": True, "actions": actions}
+
+        if normalized in BALE_TURKEY_SUPPLY_WORDS:
+            kind = "turkey-supply"
+            record()
+            opp = turkey_opportunities()
+            picks = opp["topPicks"][:6]
+            lines = []
+            for i, c in enumerate(picks, 1):
+                flag = " ⚠️نیازمند مجوز TİTCK/ÜTS" if c["regulated"] else ""
+                pull = f" · {c['activeBids']} بید فعال" if c["activeBids"] else ""
+                lines.append(f"{i}) {c['fa']} — مصرف {c['consumption']}/۵ · حاشیه ~{c['margin'][0]}-{c['margin'][1]}٪{pull}{flag}")
+            reply("🧭 پیشنهاد تأمین بر اساس مصرف × سود (ترکیه/استانبول):\n\n" + "\n".join(lines) +
+                  "\n\nتوضیح: ارقام حاشیه تقریبی و صرفاً برای اولویت‌بندی است، نه قیمت قطعاتی. قبل از عرضه اقلام نظارتی، ثبت رسمی در ترکیه الزامی است.")
+            return {"ok": True, "actions": actions}
+
+        ascii_text = text.translate(DIGIT_TRANSLATION)
+        url = _bale_extract_url(ascii_text)
+        if url:
+            kind = "audit"
+            record()  # inbox sees the request even if the audit itself fails
+            try:
+                report = audit(url)
+                host = urlparse(str(report.get("finalUrl", url))).hostname or url
+                score = int(report.get("seoScore", 0) or 0)
+                issues = [str(x)[:120] for x in (report.get("issues") or [])[:4]]
+                issue_lines = "\n".join(f"{i}. {issue}" for i, issue in enumerate(issues, 1)) or "—"
+                title = str(report.get("title", "") or "").strip()[:80] or "—"
+                body = (f"🔎 ممیزی فوری وب‌سایت: {host}\n"
+                        f"────────────\n"
+                        f"امتیاز سئو: {score} از ۱۰۰\n"
+                        f"پاسخ سرور: {report.get('status', '—')} · زمان بارگذاری: {report.get('elapsedSeconds', '—')} ثانیه\n"
+                        f"عنوان صفحه: {title}\n\n"
+                        f"مهم‌ترین موارد قابل بهبود:\n{issue_lines}\n\n"
+                        f"این یک بررسی خودکار تک‌صفحه‌ای از داده عمومی است. برای تحلیل کامل و دریافت پیشنهاد رسمی، شماره تماس خود را بفرستید.")
+                reply(body)
+                return {"ok": True, "actions": actions,
+                        "audit": {"url": report.get("finalUrl", url), "score": score, "status": report.get("status", 0)}}
+            except (ValueError, URLError, HTTPError, socket.timeout, TimeoutError) as exc:
+                reply(f"متأسفانه بررسی این آدرس ممکن نشد: {str(exc)[:200]}\nلطفاً آدرس کامل وب‌سایت را (مثلاً https://example.ir) بفرستید.")
+                return {"ok": True, "actions": actions, "auditError": str(exc)[:200]}
+
+        phone = _bale_extract_phone(ascii_text)
+        if phone:
+            kind = "phone"
+            saved = False
+            try:
+                persist_leads_database([{"name": f"کاربر بله — {name}", "phone": phone,
+                                         "source": "Bale bot inbound", "status": "callback-requested",
+                                         "resultType": "callback", "tags": ["bale-bot"]}])
+                saved = True
+            except ValueError:
+                saved = False
+            record()
+            if saved:
+                reply("✅ شماره تماس شما ثبت شد؛ کارشناس ما برای هماهنگی با شما تماس می‌گیرد. شماره شما فقط برای همین هماهنگی استفاده می‌شود. (توقف پیام‌ها: /stop)")
+            else:
+                reply("✅ درخواست تماس شما دریافت شد و در صندوق ورودی اپراتور ثبت می‌شود؛ کارشناس ما پیگیری می‌کند. (توقف پیام‌ها: /stop)")
+            return {"ok": True, "actions": actions, "lead": {"phone": phone, "saved": saved}}
+
+        kind = "fallback"
+        record()
+        reply("پیام شما دریافت شد 🙌\nآدرس وب‌سایت را برای ممیزی فوری سئو، یا شماره تماس را برای درخواست تماس کارشناس بفرستید. راهنما: /help")
+        return {"ok": True, "actions": actions}
+    except ValueError as exc:
+        # Rate limiting and validation land here — stay quiet on flood, visible on misuse.
+        if "Rate limit" in str(exc):
+            return {"ok": False, "actions": [{"type": "rate-limited"}], "error": str(exc)}
+        raise
+
+
+def bale_polling_loop():
+    try:
+        _, me = bale_api("getMe", timeout=15)
+        username = (me.get("result") or {}).get("username", "?") if isinstance(me, dict) else "?"
+        print(f"[bale-bot] long-polling as @{username}")
+    except Exception as exc:
+        print(f"[bale-bot] getMe failed ({type(exc).__name__}: {exc}); polling continues with retries")
+    backoff = 2
+    while True:
+        _bale_load_state()
+        offset = int(_BALE_STATE.get("updateOffset") or 0)
+        try:
+            _, data = bale_api("getUpdates",
+                               {"timeout": 25, "offset": offset, "allowed_updates": ["message"]},
+                               timeout=40)
+            updates = data.get("result") if isinstance(data, dict) and data.get("ok") else []
+            if not isinstance(updates, list):
+                updates = []
+            for upd in updates:
+                try:
+                    bale_process_update(upd)
+                except Exception as exc:
+                    print(f"[bale-bot] update failed: {type(exc).__name__}: {exc}")
+                offset = max(offset, int(upd.get("update_id", offset - 1)) + 1)
+            if updates:
+                with _BALE_STATE_LOCK:
+                    _BALE_STATE["updateOffset"] = offset
+                    _bale_save_state()
+            backoff = 2
+        except Exception as exc:
+            print(f"[bale-bot] poll error: {type(exc).__name__}: {exc}; retrying in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
+def start_bale_polling_if_enabled() -> bool:
+    if BALE_BOT_MODE != "polling" or not os.getenv("BALE_BOT_TOKEN", "").strip():
+        return False
+    try:  # getUpdates and webhooks are mutually exclusive
+        bale_api("deleteWebhook", {"drop_pending_updates": False}, timeout=10)
+    except Exception:
+        pass
+    thread = threading.Thread(target=bale_polling_loop, name="bale-bot-polling", daemon=True)
+    thread.start()
+    print("[bale-bot] long-polling enabled (BALE_BOT_MODE=polling)")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Turkey clinic procurement assistant
+#
+# Maps consumable demand of Turkish clinics/medical centers (focus: Istanbul),
+# ingests their bids/RFQs ("فراخوان") through operator import or an official
+# operator-approved webhook (never scraping), and ranks supply opportunities
+# by consumption volume × indicative margin. Figures are advisory estimates,
+# not guarantees; regulated goods need TİTCK/ÜTS registration.
+# ---------------------------------------------------------------------------
+
+TURKEY_REGIONS = [
+    {"id": "sisli", "fa": "شیشلی", "tr": "Şişli", "demand": 5,
+     "note": "قطب بیمارستان‌ها و کلینیک‌های خصوصی؛ قلب گردشگری سلامت"},
+    {"id": "kadikoy", "fa": "کادیکوی", "tr": "Kadıköy", "demand": 4,
+     "note": "بخش آسیایی؛ تراکم بالای کلینیک‌های زیبایی و دندان‌پزشکی"},
+    {"id": "bakirkoy", "fa": "باکیرکوی", "tr": "Bakırköy", "demand": 4,
+     "note": "نزدیک فرودگاه؛ بیمارستان‌های بزرگ و مراجعه بیماران خارجی"},
+    {"id": "besiktas", "fa": "بشیکتاش", "tr": "Beşiktaş", "demand": 4,
+     "note": "کلینیک‌های پریمیوم زیبایی و VIP"},
+    {"id": "atasehir", "fa": "آتاشهیر", "tr": "Ataşehir", "demand": 3,
+     "note": "مراکز پزشکی نوین بخش آسیایی؛ رشد سریع"},
+    {"id": "beyoglu", "fa": "بی‌اوغلو", "tr": "Beyoğlu", "demand": 3,
+     "note": "منطقه توریستی مرکزی؛ کلینیک‌های شهری"},
+    {"id": "uskudar", "fa": "اوسکودار", "tr": "Üsküdar", "demand": 3,
+     "note": "بازار داخلی بخش آسیایی؛ بیمارستان‌های دولتی و خصوصی"},
+    {"id": "bahcelievler", "fa": "باغچلی‌اولر", "tr": "Bahçelievler", "demand": 3,
+     "note": "مسطح مسکونی پرجمعیت؛ کلینیک‌های خانوادگی"},
+    {"id": "fatih", "fa": "فاتح", "tr": "Fatih", "demand": 3,
+     "note": "مرکز قدیمی؛ مراکز درمانی سنتی و پایتخت‌گردشگری"},
+    {"id": "beylikduzu", "fa": "بیلیکدوزو", "tr": "Beylikdüzü", "demand": 3,
+     "note": "غرب استانبول؛ رشد جمعیت و کلینیک‌های جدید"},
+]
+
+# Regional alias → region id (fa/tr/ascii spellings)
+TURKEY_REGION_ALIASES = {}
+for _r in TURKEY_REGIONS:
+    TURKEY_REGION_ALIASES[_r["tr"].lower()] = _r["id"]
+    TURKEY_REGION_ALIASES[_r["fa"]] = _r["id"]
+    TURKEY_REGION_ALIASES[_r["id"]] = _r["id"]
+TURKEY_REGION_ALIASES.update({
+    "sisli": "sisli", "şişli": "sisli", "kadikoy": "kadikoy", "kadıköy": "kadikoy",
+    "bakirkoy": "bakirkoy", "bakırköy": "bakirkoy", "besiktas": "besiktas", "beşiktaş": "besiktas",
+    "atasehir": "atasehir", "ataşehir": "atasehir", "beyoglu": "beyoglu", "beyoğlu": "beyoglu",
+    "uskudar": "uskudar", "üsküdar": "uskudar", "bahcelievler": "bahcelievler", "bahçelievler": "bahcelievler",
+    "fatih": "fatih", "beylikduzu": "beylikduzu", "beylikdüzü": "beylikduzu",
+    "istanbul": "istanbul", "استانبول": "istanbul",
+})
+
+# ~10+ consumable categories for Turkish clinics: consumption 1-5, indicative
+# gross-margin range (%), regulatory flag. Advisory estimates, not quotes.
+TURKEY_CONSUMABLES = [
+    {"id": "exam-gloves", "fa": "دستکش معاینه (نیتریل/لاتکس)", "consumption": 5, "margin": [5, 12],
+     "regulated": False, "keywords": ["glove", "gloves", "eldiven", "دستکش"]},
+    {"id": "syringes-needles", "fa": "سرنگ، سوزن و ست‌های تزریق", "consumption": 5, "margin": [6, 14],
+     "regulated": False, "keywords": ["syringe", "needle", "şırınga", "sirnga", "enjektör", "enjektor", "سرنگ", "سوزن"]},
+    {"id": "sterile-dressings", "fa": "گاز استریل، پانسمان و بخیه", "consumption": 4, "margin": [8, 16],
+     "regulated": False, "keywords": ["gauze", "dressing", "suture", "pansuman", "gazlı", "gazli", "sütür", "پانسمان", "بخیه", "گاز استریل"]},
+    {"id": "masks-respirators", "fa": "ماسک جراحی و N95/FFP2", "consumption": 4, "margin": [6, 12],
+     "regulated": False, "keywords": ["mask", "maske", "ماسک", "n95", "ffp2", "respirator"]},
+    {"id": "disinfectants", "fa": "محلول‌های ضدعفونی سطوح و دست", "consumption": 4, "margin": [10, 20],
+     "regulated": False, "keywords": ["disinfect", "dezenfekt", "antisep", "ضدعفونی", "الکل", "گندزدا"]},
+    {"id": "dental-composites", "fa": "مواد ترمیمی و قالب‌گیری دندان", "consumption": 3, "margin": [15, 30],
+     "regulated": False, "keywords": ["composite", "kompozit", "dental", "diş ", "dis ", "کامپوزیت", "دندان", "amalgam", "bonding"]},
+    {"id": "dental-implants", "fa": "ایمپلنت و اجزای پروتز دندان", "consumption": 3, "margin": [20, 45],
+     "regulated": True, "keywords": ["implant", "ایمپلنت", "abutment", "پیشرفته ایمپلنت"]},
+    {"id": "dermal-fillers", "fa": "فیلرهای پوستی (زیبایی)", "consumption": 2, "margin": [25, 50],
+     "regulated": True, "keywords": ["filler", "dolgu", "فیلر", "hyaluron", "هیالورونیک", "dermal"]},
+    {"id": "botulinum-toxin", "fa": "توکسین بوتولینوم (بوتاکس)", "consumption": 2, "margin": [30, 55],
+     "regulated": True, "keywords": ["botox", "botoks", "toxin", "toksin", "بوتاکس", "توکسین"]},
+    {"id": "pdo-threads", "fa": "نخ‌های لیفت PDO/PLLA", "consumption": 2, "margin": [20, 40],
+     "regulated": True, "keywords": ["thread", "pdo", "plla", "نخ", "لیفت", "iplik"]},
+    {"id": "prp-microneedling", "fa": "کیت‌های PRP و کارتریج میکرونیدلینگ", "consumption": 2, "margin": [25, 45],
+     "regulated": False, "keywords": ["prp", "microneed", "mikroiğne", "kit ", "کیت", "میکرونیدل"]},
+]
+
+TURKEY_BIDS: deque[dict] = deque(maxlen=500)
+
+TURKEY_DISCOVERY_LINKS = {
+    "ekap": "https://ekap.kik.gov.tr/EKAP/Ortak/IhaleArama/index.html",
+    "ekapEnglish": "https://www.kik.gov.tr/",
+    "timExporters": "https://www.tim.org.tr/en",
+    "medicalistanbulFair": "https://www.google.com/search?q=Istanbul+medical+consumables+fair+exhibitors",
+}
+
+
+# --- Market 2: Istanbul restaurants (with Bağcılar and 9 more districts) ---
+TURKEY_RESTAURANT_REGIONS = [
+    {"id": "bagcilar", "fa": "باغجیلار", "tr": "Bağcılar", "demand": 5,
+     "note": "متراکم‌ترین منطقه مسکونی؛ رستوران‌های محلی و بیرون‌بر فراوان"},
+    {"id": "esenler", "fa": "اسنلر", "tr": "Esenler", "demand": 4,
+     "note": "تراکم بالای غذاخوری‌های قیمت‌مناسب و عبوری"},
+    {"id": "gungoren", "fa": "گونگورن", "tr": "Güngören", "demand": 4,
+     "note": "بازار محلی پرتردد؛ تقاضای پایدار مواد اولیه"},
+    {"id": "kucukcekmece", "fa": "کوچوک‌چکمجه", "tr": "Küçükçekmece", "demand": 4,
+     "note": "رشد جمعیت و رستوران‌های خانوادگی"},
+    {"id": "esenyurt", "fa": "اسنیورت", "tr": "Esenyurt", "demand": 4,
+     "note": "حجم بالای بیرون‌بر؛ حساس به قیمت"},
+    {"id": "umraniye", "fa": "عمرانیه", "tr": "Ümraniye", "demand": 4,
+     "note": "بخش آسیایی؛ رستوران‌های اداری و کارگری"},
+    {"id": "pendik", "fa": "پندیک", "tr": "Pendik", "demand": 3,
+     "note": "کنار فرودگاه صبیحا؛ غذاخوری‌های ساحلی و عبوری"},
+    {"id": "kartal", "fa": "کارتال", "tr": "Kartal", "demand": 3,
+     "note": "ساحل آسیایی؛ رستوران‌های ماهی و محلی"},
+    {"id": "sultanbeyli", "fa": "سلطان‌بیلی", "tr": "Sultanbeyli", "demand": 3,
+     "note": "منطقه در حال رشد؛ قیمت‌محور"},
+    {"id": "gaziosmanpasa", "fa": "غازی‌عثمان‌پاشا", "tr": "Gaziosmanpaşa", "demand": 3,
+     "note": "بازار سنتی و فروشگاه‌های مواد غذایی متمرکز"},
+]
+
+TURKEY_RESTAURANT_REGION_ALIASES = {}
+for _r in TURKEY_RESTAURANT_REGIONS:
+    TURKEY_RESTAURANT_REGION_ALIASES[_r["tr"].lower()] = _r["id"]
+    TURKEY_RESTAURANT_REGION_ALIASES[_r["fa"]] = _r["id"]
+    TURKEY_RESTAURANT_REGION_ALIASES[_r["id"]] = _r["id"]
+TURKEY_RESTAURANT_REGION_ALIASES.update({
+    "bagcilar": "bagcilar", "bağcılar": "bagcilar", "bagcılar": "bagcilar",
+    "esenler": "esenler", "gungoren": "gungoren", "güngören": "gungoren",
+    "kucukcekmece": "kucukcekmece", "küçükçekmece": "kucukcekmece",
+    "esenyurt": "esenyurt", "umraniye": "umraniye", "ümraniye": "umraniye",
+    "pendik": "pendik", "kartal": "kartal", "sultanbeyli": "sultanbeyli",
+    "gaziosmanpasa": "gaziosmanpasa", "gaziosmanpaşa": "gaziosmanpasa",
+    "istanbul": "istanbul", "استانبول": "istanbul",
+})
+
+# 10 staple restaurant raw materials: consumption 1-5, indicative gross-margin
+# range (%), regulatory/certification notes. Advisory estimates, not quotes.
+TURKEY_RESTAURANT_CONSUMABLES = [
+    {"id": "frying-oil", "fa": "روغن سرخ‌کردنی و مایع (تن/لیتر)", "consumption": 5, "margin": [5, 10],
+     "regulated": False, "keywords": ["oil", "yağ", "yag", "روغن", "frying"]},
+    {"id": "rice", "fa": "برنج (ایرانی/بالدو/اوسمانجیک)", "consumption": 5, "margin": [6, 12],
+     "regulated": False, "keywords": ["rice", "pirinç", "pirinc", "برنج"]},
+    {"id": "chicken", "fa": "مرغ تازه/منجمد", "consumption": 5, "margin": [7, 13],
+     "regulated": False, "certNote": "گواهی حلال و زنجیره سرد توصیه می‌شود",
+     "keywords": ["chicken", "tavuk", "مرغ", "جوجه"]},
+    {"id": "beef", "fa": "گوشت قرمز (گوساله/گوسفندی)", "consumption": 4, "margin": [8, 15],
+     "regulated": False, "certNote": "گواهی حلال و زنجیره سرد توصیه می‌شود",
+     "keywords": ["beef", "meat", "kırmızı et", "kirmizi et", "dana", "et ", "گوشت", "قصابی"]},
+    {"id": "vegetables", "fa": "سبزیجات و صیفی‌جات تازه", "consumption": 5, "margin": [8, 18],
+     "regulated": False, "certNote": "فسادپذیر — لجستیک سریع/سرد",
+     "keywords": ["vegetable", "sebze", "سبزیجات", "صیفی", "میوه", "salata"]},
+    {"id": "flour-bakery", "fa": "آرد و مواد نانوایی", "consumption": 4, "margin": [6, 12],
+     "regulated": False, "keywords": ["flour", "un ", "آرد", "نان", "ekmek"]},
+    {"id": "dairy", "fa": "لبنیات (پنیر، ماست، کره)", "consumption": 4, "margin": [8, 15],
+     "regulated": False, "certNote": "زنجیره سرد الزامی",
+     "keywords": ["dairy", "cheese", "peynir", "yoğurt", "yogurt", "لبنیات", "پنیر", "ماست", "کره"]},
+    {"id": "packaging", "fa": "ظروف بیرون‌بر و بسته‌بندی", "consumption": 4, "margin": [10, 20],
+     "regulated": False, "keywords": ["packag", "paket", "ظرف", "بسته‌بندی", "بیرون‌بر", "kutu"]},
+    {"id": "legumes-spices", "fa": "حبوبات و ادویه‌جات", "consumption": 3, "margin": [12, 25],
+     "regulated": False, "keywords": ["bakliyat", "baharat", "legume", "spice", "حبوبات", "ادویه", "پولکی"]},
+    {"id": "beverages", "fa": "نوشیدنی و آب معدنی", "consumption": 4, "margin": [5, 10],
+     "regulated": False, "keywords": ["beverage", "içecek", "icecek", "su ", "نوشیدنی", "آب معدنی", "نوشابه"]},
+]
+
+RESTAURANT_DISCOVERY_LINKS = {
+    "istanbulWholesaleMarkets": "https://www.google.com/search?q=Istanbul+wholesale+food+market+restaurant+suppliers",
+    "timFoodExporters": "https://www.tim.org.tr/en",
+    "restaurantSupplyFairs": "https://www.google.com/search?q=Istanbul+HORECA+fair+food+beverage+exhibitors",
+}
+
+TURKEY_MARKETS = {
+    "clinics": {
+        "fa": "کلینیک‌ها و مراکز پزشکی ترکیه",
+        "regions": TURKEY_REGIONS,
+        "aliases": TURKEY_REGION_ALIASES,
+        "consumables": TURKEY_CONSUMABLES,
+        "links": TURKEY_DISCOVERY_LINKS,
+        "regulatory": "Regulated goods (implants, fillers, toxin, threads) require TİTCK/ÜTS registration and licensed local distribution before supply.",
+    },
+    "restaurants": {
+        "fa": "رستوران‌های استانبول",
+        "regions": TURKEY_RESTAURANT_REGIONS,
+        "aliases": TURKEY_RESTAURANT_REGION_ALIASES,
+        "consumables": TURKEY_RESTAURANT_CONSUMABLES,
+        "links": RESTAURANT_DISCOVERY_LINKS,
+        "regulatory": "Food supply should follow halal certification and cold-chain rules for meat, poultry and dairy.",
+    },
+}
+
+
+def _turkey_consumable_score(item: dict) -> float:
+    margin_mid = (item["margin"][0] + item["margin"][1]) / 2
+    return round(item["consumption"] * margin_mid, 1)
+
+
+def turkey_consumables_ranked(market: str = "clinics") -> list[dict]:
+    ranked = []
+    for item in TURKEY_MARKETS.get(market, TURKEY_MARKETS["clinics"])["consumables"]:
+        ranked.append({**item, "score": _turkey_consumable_score(item)})
+    ranked.sort(key=lambda x: (-x["score"], -x["consumption"]))
+    return ranked
+
+
+def turkey_match_region(text: str, market: str = "clinics") -> str | None:
+    normalized = _bale_normalize(text) if text else ""
+    if not normalized:
+        return None
+    aliases = TURKEY_MARKETS.get(market, TURKEY_MARKETS["clinics"])["aliases"]
+    for alias, region_id in aliases.items():
+        if alias in normalized:
+            return region_id
+    return None
+
+
+def turkey_match_category(text: str, market: str = "clinics") -> dict | None:
+    normalized = (text or "").lower()
+    if not normalized.strip():
+        return None
+    best = None
+    for item in TURKEY_MARKETS.get(market, TURKEY_MARKETS["clinics"])["consumables"]:
+        matched = [kw for kw in item["keywords"] if kw.lower() in normalized]
+        if matched:
+            # more keyword hits wins; ties go to the more specific (longer) keyword
+            rank = (len(matched), max(len(kw) for kw in matched))
+            if best is None or rank > best[0]:
+                best = (rank, item)
+    return best[1] if best else None
+
+
+def _turkey_budget_factor(budget_try: float | None) -> float:
+    if not budget_try or budget_try <= 0:
+        return 1.0
+    if budget_try < 50_000:
+        return 1.0
+    if budget_try < 250_000:
+        return 1.15
+    if budget_try < 1_000_000:
+        return 1.3
+    return 1.45
+
+
+def _turkey_deadline_factor(deadline: str) -> float:
+    if not deadline:
+        return 1.0
+    try:
+        dt = time.strptime(deadline.strip()[:10], "%Y-%m-%d")
+        days = (time.mktime(dt) - time.time()) / 86400
+        if 0 <= days <= 30:
+            return 1.15
+    except Exception:
+        pass
+    return 1.0
+
+
+def normalize_turkey_bid(item: dict, market: str = "clinics") -> dict | None:
+    if market not in TURKEY_MARKETS:
+        raise ValueError(f"Unknown market '{market}'. Use one of: {', '.join(TURKEY_MARKETS)}")
+    market_obj = TURKEY_MARKETS[market]
+    clinic = str(item.get("clinic", item.get("name", item.get("buyer", "")))).strip()[:160]
+    need = str(item.get("need", item.get("text", item.get("description", item.get("category", ""))))).strip()[:400]
+    if not clinic and not need:
+        return None
+    region_raw = str(item.get("region", item.get("district", item.get("city", "")))).strip()[:80]
+    region_id = item.get("regionId") if str(item.get("regionId", "")).strip() in {r["id"] for r in market_obj["regions"]} else None
+    if not region_id:
+        region_id = turkey_match_region(f"{region_raw} {clinic} {need}", market) or "istanbul"
+    category = turkey_match_category(f"{item.get('category', '')} {need}", market) or {}
+    try:
+        quantity = int(float(item.get("quantity", 0) or 0)) or None
+    except Exception:
+        quantity = None
+    try:
+        budget = float(str(item.get("budgetTry", item.get("budget", ""))).replace(",", "") or 0) or None
+    except Exception:
+        budget = None
+    deadline = str(item.get("deadline", item.get("due", ""))).strip()[:24]
+    contact = str(item.get("contact", item.get("phone", item.get("email", "")))).strip()[:200]
+    source = str(item.get("source", item.get("sourceUrl", ""))).strip()[:400]
+    category_id = category.get("id", "uncategorized")
+    default_need = "نیاز عمومی کلینیک" if market == "clinics" else "تأمین مواد اولیه رستوران"
+    return {
+        "id": hashlib.sha256(f"{market}|{clinic}|{need}|{deadline}".encode("utf-8")).hexdigest()[:14],
+        "market": market,
+        "clinic": clinic or "—",
+        "need": need or category.get("fa", default_need),
+        "regionId": region_id,
+        "regionFa": next((r["fa"] for r in market_obj["regions"] if r["id"] == region_id), "استانبول (سایر)"),
+        "categoryId": category_id,
+        "categoryFa": category.get("fa", "متفرقه / نامشخص"),
+        "quantity": quantity,
+        "budgetTry": budget,
+        "deadline": deadline,
+        "contact": contact,
+        "source": source or "operator-import",
+        "sample": item.get("sample") is True,
+        "importedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def turkey_score_bid(bid: dict) -> dict:
+    market_obj = TURKEY_MARKETS.get(bid.get("market") or "clinics", TURKEY_MARKETS["clinics"])
+    category = next((c for c in market_obj["consumables"] if c["id"] == bid.get("categoryId")), None)
+    consumption = category["consumption"] if category else 2
+    margin = category["margin"] if category else [8, 18]
+    margin_mid = (margin[0] + margin[1]) / 2
+    base = min(100.0, consumption * margin_mid)
+    size_f = _turkey_budget_factor(bid.get("budgetTry"))
+    urgent_f = _turkey_deadline_factor(bid.get("deadline", ""))
+    score = max(5, min(100, round(base * size_f * urgent_f)))
+    grade = "A" if score >= 70 else "B" if score >= 45 else "C"
+    return {
+        **bid,
+        "consumptionLevel": consumption,
+        "marginRange": margin,
+        "regulated": bool(category and category.get("regulated")),
+        "certNote": (category or {}).get("certNote"),
+        "opportunityScore": score,
+        "grade": grade,
+        "factors": {"base": round(base, 1), "budgetFactor": size_f, "deadlineFactor": urgent_f},
+    }
+
+
+def turkey_bids_import(payload: dict) -> dict:
+    market = str(payload.get("market", "clinics")).strip().lower()
+    if market not in TURKEY_MARKETS:
+        raise ValueError(f"Unknown market '{market}'. Use one of: {', '.join(TURKEY_MARKETS)}")
+    raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    text = str(payload.get("text", payload.get("csv", ""))).strip()
+    parsed = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith(("clinic", "نام")):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        while len(parts) < 3:
+            parts.append("")
+        parsed.append({"clinic": parts[0], "region": parts[1], "need": parts[2],
+                       "quantity": parts[3] if len(parts) > 3 else "",
+                       "budgetTry": parts[4] if len(parts) > 4 else "",
+                       "deadline": parts[5] if len(parts) > 5 else ""})
+    for item in raw_items[:200]:
+        if isinstance(item, dict):
+            parsed.append({**item, "market": item.get("market", market)})
+    bids = [b for b in (normalize_turkey_bid(x, x.get("market", market)) for x in parsed[:200]) if b]
+    if not bids:
+        raise ValueError("No valid Turkey bid rows found. Send items[] or pipe-separated text: کلینیک | منطقه | نیاز | تعداد | بودجه(لیر) | ددلاین")
+    existing = {b["id"] for b in TURKEY_BIDS}
+    fresh = [b for b in bids if b["id"] not in existing]
+    for bid in reversed(fresh):
+        TURKEY_BIDS.appendleft(bid)
+    saved_db = False
+    if fresh and supabase_settings()["configured"]:
+        try:  # best-effort mirror into the lead database; the in-memory feed remains primary
+            persist_leads_database([{**b, "name": b["clinic"], "status": f"turkey-bid-{b['market']}",
+                                     "resultType": "turkey-bid", "tags": ["turkey", b["market"], b["categoryId"]]}
+                                    for b in fresh])
+            saved_db = True
+        except ValueError:
+            saved_db = False
+    return {"ok": True, "market": market, "imported": len(fresh), "skippedDuplicates": len(bids) - len(fresh),
+            "total": sum(1 for b in TURKEY_BIDS if b["market"] == market), "mirroredToDb": saved_db}
+
+
+def turkey_bids_sync() -> dict:
+    webhook = os.getenv("TURKEY_BIDS_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return {"ok": True, "configured": False, "imported": 0,
+                "message": "No official webhook is configured. Use POST /api/turkey/bids/import (file/paste) or the discovery links."}
+    token = os.getenv("TURKEY_BIDS_WEBHOOK_TOKEN", "").strip()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    status, data = post_json(webhook, {"mode": "clinic-bids", "market": "TR-istanbul"}, headers, timeout=30)
+    items = data.get("items", []) if isinstance(data, dict) else []
+    result = turkey_bids_import({"items": items, "source": "official-webhook"})
+    return {"ok": True, "configured": True, "providerStatus": status, **result}
+
+
+def turkey_opportunities(market: str = "clinics") -> dict:
+    if market == "all":
+        markets = list(TURKEY_MARKETS)
+    elif market in TURKEY_MARKETS:
+        markets = [market]
+    else:
+        raise ValueError(f"Unknown market '{market}'. Use one of: {', '.join(TURKEY_MARKETS)} or 'all'")
+    primary = TURKEY_MARKETS[markets[0]]
+    consumables: list[dict] = []
+    regions: list[dict] = []
+    for mid in markets:
+        consumables.extend(turkey_consumables_ranked(mid))
+        regions.extend(TURKEY_MARKETS[mid]["regions"])
+    scored = sorted((turkey_score_bid(b) for b in TURKEY_BIDS if b["market"] in markets),
+                    key=lambda b: -b["opportunityScore"])
+    category_pull: dict[str, int] = {}
+    for b in scored:
+        category_pull[b["categoryId"]] = category_pull.get(b["categoryId"], 0) + 1
+    region_rows = []
+    for region in regions:
+        region_bids = [b for b in scored if b["regionId"] == region["id"]]
+        region_rows.append({**region, "activeBids": len(region_bids),
+                            "opportunity": min(100, region["demand"] * 20 + len(region_bids) * 5)})
+    region_rows.sort(key=lambda r: -r["opportunity"])
+    top_picks = []
+    for c in consumables:
+        pull = category_pull.get(c["id"], 0)
+        # gentle market-pull boost: keeps separation even when every category has many live bids
+        top_picks.append({**c, "activeBids": pull,
+                          "recommendationScore": min(100, round(c["score"] * (1 + 0.05 * pull), 1))})
+    top_picks.sort(key=lambda c: -c["recommendationScore"])
+    sample_count = sum(1 for b in scored if b.get("sample"))
+    title = "Turkey — " + " + ".join(TURKEY_MARKETS[m]["fa"] for m in markets) + " (Istanbul focus)"
+    return {
+        "ok": True,
+        "market": title,
+        "marketId": market,
+        "summary": {"regionCount": len(regions), "consumableCategories": len(consumables),
+                    "activeBids": len(scored), "sampleBids": sample_count,
+                    "webhookConfigured": bool(os.getenv("TURKEY_BIDS_WEBHOOK_URL", "").strip())},
+        "consumables": consumables,
+        "topPicks": top_picks[:10],
+        "regions": region_rows,
+        "bids": scored[:100],
+        "discoveryLinks": {m: TURKEY_MARKETS[m]["links"] for m in markets} if len(markets) > 1 else primary["links"],
+        "samplesNote": ("Rows marked sample:true are deterministic educational examples with fictional "
+                        "contacts — not real RFQs. Disable with TURKEY_SEED_SAMPLE_BIDS=false.") if sample_count else None,
+        "disclaimer": ("Consumption (1-5) and margin ranges are advisory market estimates for prioritization — "
+                       "not quotes or guarantees. " + " ".join(TURKEY_MARKETS[m]["regulatory"] for m in markets)),
+    }
+
+
+# --- Deterministic sample bids: 100 Istanbul restaurant RFQs (educational) ---
+_RESTAURANT_SAMPLE_TEMPLATES = [
+    {"categoryId": "frying-oil", "need": "روغن سرخ‌کردنی (yağ) تأمین ماهانه", "qty": (500, 3000), "budget": (30_000, 140_000)},
+    {"categoryId": "rice", "need": "برنج بالدو/ایرانی (pirinç) تناژ ماهانه", "qty": (800, 3000), "budget": (25_000, 180_000)},
+    {"categoryId": "chicken", "need": "مرغ تازه (tavuk) تأمین هفتگی — کیلوگرم", "qty": (300, 1500), "budget": (60_000, 350_000)},
+    {"categoryId": "beef", "need": "گوشت گوساله (dana eti) هفتگی — کیلوگرم", "qty": (100, 600), "budget": (70_000, 450_000)},
+    {"categoryId": "vegetables", "need": "سبزیجات و صیفی‌جات تازه (sebze) روزانه", "qty": (200, 1000), "budget": (15_000, 90_000)},
+    {"categoryId": "flour-bakery", "need": "آرد نانوایی (un) ماهانه — کیلوگرم", "qty": (1000, 5000), "budget": (15_000, 100_000)},
+    {"categoryId": "dairy", "need": "پنیر و ماست (peynir/yoğurt) ماهانه", "qty": (100, 500), "budget": (20_000, 120_000)},
+    {"categoryId": "packaging", "need": "ظرف بیرون‌بر و بسته‌بندی (paket) — عدد", "qty": (5000, 85000), "budget": (10_000, 120_000)},
+    {"categoryId": "legumes-spices", "need": "حبوبات و ادویه (bakliyat/baharat) فصلی", "qty": (50, 400), "budget": (10_000, 80_000)},
+    {"categoryId": "beverages", "need": "نوشیدنی و آب معدنی (içecek/su) ماهانه", "qty": (300, 2000), "budget": (8_000, 60_000)},
+]
+
+_RESTAURANT_NAMES = ["Anadolu", "Boğaz", "Hünkar", "Lezzet", "Saray", "Marmara", "Ege", "Kervan",
+                     "İstanbul", "Dostlar", "Şehzade", "Pera", "Tarihi", "Yıldız", "Anka"]
+_RESTAURANT_SUFFIXES = ["Sofrası", "Lokantası", "Kebap Evi", "Restoranı", "Ocakbaşı", "Pide Evi"]
+
+
+def _sample_det(seed_text: str, low: int, high: int) -> int:
+    span = max(1, high - low + 1)
+    return low + (int(hashlib.sha256(seed_text.encode("utf-8")).hexdigest()[:12], 16) % span)
+
+
+def _turkey_restaurant_sample_bids(count: int = 100) -> list[dict]:
+    regions = TURKEY_RESTAURANT_REGIONS
+    bids = []
+    base_epoch = time.mktime(time.strptime("2026-08-08", "%Y-%m-%d"))
+    for i in range(max(1, min(count, 500))):
+        region = regions[i % len(regions)]
+        template = _RESTAURANT_SAMPLE_TEMPLATES[i % len(_RESTAURANT_SAMPLE_TEMPLATES)]
+        head = _RESTAURANT_NAMES[(i * 7 + 3) % len(_RESTAURANT_NAMES)]
+        tail = _RESTAURANT_SUFFIXES[(i * 5 + 1) % len(_RESTAURANT_SUFFIXES)]
+        seed = f"{region['id']}-{i}"
+        qty = _sample_det(seed + "-q", *template["qty"])
+        budget = _sample_det(seed + "-b", *template["budget"])
+        deadline = time.strftime("%Y-%m-%d", time.localtime(base_epoch + ((i * 3) % 40) * 86400))
+        phone = "+90 53" + str(_sample_det(seed + "-p1", 0, 9)) + " " + \
+            f"{_sample_det(seed + '-p2', 100, 999)} {_sample_det(seed + '-p3', 1000, 9999)}"
+        item = {
+            "clinic": f"رستوران {head} {tail}", "name": f"رستوران {head} {tail}",
+            "region": region["tr"], "regionId": region["id"],
+            "need": template["need"], "quantity": qty, "budgetTry": budget,
+            "deadline": deadline, "contact": phone, "source": "seed-sample",
+            "sample": True,
+        }
+        bid = normalize_turkey_bid(item, "restaurants")
+        if bid:
+            bids.append(bid)
+    return bids
+
+
+def turkey_seed_sample_bids(count: int = 100) -> dict:
+    existing = {b["id"] for b in TURKEY_BIDS}
+    generated = _turkey_restaurant_sample_bids(count)
+    fresh = [b for b in generated if b["id"] not in existing]
+    TURKEY_BIDS.extend(fresh)
+    return {"ok": True, "imported": len(fresh), "skippedDuplicates": len(generated) - len(fresh),
+            "total": sum(1 for b in TURKEY_BIDS if b["market"] == "restaurants"),
+            "note": "Educational sample bids (sample:true) with fictional contacts."}
+
+
+if env_flag("TURKEY_SEED_SAMPLE_BIDS", True):
+    try:
+        turkey_seed_sample_bids(max(1, min(int(os.getenv("TURKEY_SEED_SAMPLE_COUNT", "100")), 500)))
+    except Exception:
+        pass  # sample seeding must never block startup
+
+
+def _turkey_brief_lines(consumables: list[dict], limit: int) -> str:
+    lines = []
+    for i, c in enumerate(consumables[:limit], 1):
+        flag = " ⚠️نظارتی" if c["regulated"] else ""
+        lines.append(f"{i}) {c['fa']} — مصرف {c['consumption']}/۵ · حاشیه ~{c['margin'][0]} تا {c['margin'][1]}٪{flag}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Turkey B2B supplier marketplace (Istanbul restaurants + clinics).
+# Buyers publish needs as bids; suppliers register products with unit price,
+# stock, minimum order and delivery zones. The engine then compares offers
+# for one product category across suppliers and builds a cheapest-reliable
+# purchase plan ("smart cart") for a list of needs. Seeded directory rows are
+# educational samples (sample:true) and can be disabled in production.
+
+TURKEY_SUPPLIERS: deque[dict] = deque(maxlen=500)
+
+_SUPPLIER_ASPECTS = ("price", "quality", "delivery", "satisfaction")
+
+
+def _supplier_product_category_id(p: dict, market: str) -> str | None:
+    category_raw = str(p.get("categoryId") or p.get("category") or "").strip()[:60]
+    if category_raw and category_raw in {c["id"] for c in TURKEY_MARKETS[market]["consumables"]}:
+        return category_raw
+    name = str(p.get("name") or p.get("product") or "").strip()[:160]
+    matched = turkey_match_category(f"{category_raw} {name}", market)
+    return matched["id"] if matched else None
+
+
+def normalize_supplier_product(p: dict, market: str) -> dict | None:
+    if not isinstance(p, dict):
+        return None
+    category_id = _supplier_product_category_id(p, market)
+    if not category_id:
+        return None
+    try:
+        price = round(float(str(p.get("priceTry", p.get("price", ""))).replace(",", "")), 2)
+    except Exception:
+        return None
+    if price <= 0 or price > 10_000_000:
+        return None
+    name = str(p.get("name") or p.get("product") or "").strip()[:160]
+    category_fa = next((c["fa"] for c in TURKEY_MARKETS[market]["consumables"] if c["id"] == category_id), category_id)
+
+    def _int_field(key: str, default: int, low: int, high: int) -> int:
+        try:
+            return max(low, min(int(float(str(p.get(key, default)).replace(",", ""))), high))
+        except Exception:
+            return default
+
+    stock_raw = p.get("stock", None)
+    try:
+        stock = max(0, min(int(float(str(stock_raw).replace(",", ""))), 100_000_000)) if stock_raw not in (None, "") else None
+    except Exception:
+        stock = None
+    return {
+        "categoryId": category_id,
+        "categoryFa": category_fa,
+        "name": name or category_fa,
+        "unit": str(p.get("unit") or "کیلوگرم").strip()[:24] or "کیلوگرم",
+        "priceTry": price,
+        "stock": stock,  # None means "availability not declared" (treated as available)
+        "minOrder": _int_field("minOrder", 1, 1, 10_000_000),
+        "deliveryDays": _int_field("deliveryDays", 2, 0, 30),
+    }
+
+
+def normalize_turkey_supplier(item: dict, market: str = "restaurants") -> dict | None:
+    if market not in TURKEY_MARKETS:
+        raise ValueError(f"Unknown market '{market}'. Use one of: {', '.join(TURKEY_MARKETS)}")
+    market_obj = TURKEY_MARKETS[market]
+    name = str(item.get("name") or item.get("company") or "").strip()[:160]
+    if not name:
+        return None
+    region_raw = str(item.get("region") or item.get("district") or item.get("regionId") or "").strip()[:80]
+    region_id = item.get("regionId") if str(item.get("regionId", "")).strip() in {r["id"] for r in market_obj["regions"]} else None
+    if not region_id:
+        region_id = turkey_match_region(f"{region_raw} {name}", market) or "istanbul"
+    region_entry = next((r for r in market_obj["regions"] if r["id"] == region_id), None)
+    zones: list[str] = []
+    for z in list(item.get("deliveryZones") or item.get("zones") or [])[:15]:
+        zone = turkey_match_region(str(z), market)
+        if zone and zone != "istanbul" and zone not in zones:
+            zones.append(zone)
+    products = []
+    seen_categories: set[str] = set()
+    for p in list(item.get("products") or [])[:50]:
+        product = normalize_supplier_product(p, market)
+        if not product:
+            continue
+        key = f"{product['categoryId']}|{product['name']}|{product['priceTry']}"
+        if key not in seen_categories:
+            seen_categories.add(key)
+            products.append(product)
+    if not products:
+        return None
+    return {
+        "id": hashlib.sha256(f"supplier|{market}|{name}|{region_id}".encode("utf-8")).hexdigest()[:14],
+        "market": market,
+        "name": name,
+        "regionId": region_id,
+        "regionFa": region_entry["fa"] if region_entry else "استانبول (سایر)",
+        "regionTr": region_entry["tr"] if region_entry else "İstanbul",
+        "phone": str(item.get("phone") or item.get("contact") or "").strip()[:60],
+        "deliveryZones": zones,  # empty list = delivers everywhere in Istanbul
+        "products": products,
+        "rating": {"count": 0, "avg": None, "aspects": {}},
+        "source": str(item.get("source") or "api")[:60],
+        "sample": bool(item.get("sample", False)),
+        "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def _supplier_public(s: dict, with_products: bool = True) -> dict:
+    rating = s.get("rating") or {}
+    out = {k: v for k, v in s.items() if k not in {"rating", "products"}}
+    out["productCount"] = len(s.get("products") or [])
+    out["categories"] = sorted({p["categoryId"] for p in s.get("products") or []})
+    out["ratingAvg"] = rating.get("avg")
+    out["ratingCount"] = rating.get("count", 0)
+    out["ratingAspects"] = {k: round(v["sum"] / v["n"], 2) for k, v in (rating.get("aspects") or {}).items() if v.get("n")}
+    if with_products:
+        out["products"] = s.get("products") or []
+    return out
+
+
+def turkey_suppliers_register(payload: dict) -> dict:
+    market = str(payload.get("market") or "restaurants").strip().lower() or "restaurants"
+    if market not in TURKEY_MARKETS:
+        raise ValueError(f"Unknown market '{market}'. Use one of: {', '.join(TURKEY_MARKETS)}")
+    raw_items = payload.get("suppliers") if isinstance(payload.get("suppliers"), list) else [payload]
+    upserted = []
+    for raw in raw_items[:20]:
+        if not isinstance(raw, dict):
+            continue
+        raw = {**raw, "market": raw.get("market") or market}
+        try:
+            supplier = normalize_turkey_supplier(raw, str(raw["market"]).strip().lower())
+        except ValueError:
+            continue
+        if not supplier:
+            continue
+        existing = next((s for s in TURKEY_SUPPLIERS if s["id"] == supplier["id"]), None)
+        if existing:  # upsert keeps the accumulated rating and the first-seen timestamp
+            supplier["rating"] = existing.get("rating") or supplier["rating"]
+            supplier["createdAt"] = existing.get("createdAt") or supplier["createdAt"]
+            TURKEY_SUPPLIERS.remove(existing)
+        TURKEY_SUPPLIERS.appendleft(supplier)
+        upserted.append({"id": supplier["id"], "name": supplier["name"],
+                         "regionId": supplier["regionId"], "productCount": len(supplier["products"])})
+    if not upserted:
+        raise ValueError("No valid supplier found. Each supplier needs a name and at least one product "
+                         "with a known category and a positive priceTry.")
+    return {"ok": True, "upserted": len(upserted), "suppliers": upserted,
+            "total": sum(1 for s in TURKEY_SUPPLIERS if s["market"] == market)}
+
+
+def turkey_suppliers_list(market: str = "restaurants") -> dict:
+    market = str(market or "restaurants").strip().lower() or "restaurants"
+    if market not in TURKEY_MARKETS:
+        raise ValueError(f"Unknown market '{market}'. Use one of: {', '.join(TURKEY_MARKETS)}")
+    rows = [s for s in TURKEY_SUPPLIERS if s["market"] == market]
+    sample_count = sum(1 for s in rows if s.get("sample"))
+    return {
+        "ok": True,
+        "market": market,
+        "count": len(rows),
+        "suppliers": [_supplier_public(s, with_products=False) for s in rows],
+        "samplesNote": (f"{sample_count} of these suppliers are educational samples with fictional "
+                        "contacts. Disable with TURKEY_SEED_SAMPLE_SUPPLIERS=false.") if sample_count else None,
+        "disclaimer": "Listings are self-reported by suppliers; verify licenses, halal certificates and prices before contracting.",
+    }
+
+
+def turkey_supplier_rate(payload: dict) -> dict:
+    supplier_id = str(payload.get("supplierId") or payload.get("id") or "").strip()[:20]
+    supplier = next((s for s in TURKEY_SUPPLIERS if s["id"] == supplier_id), None)
+    if not supplier:
+        raise ValueError(f"Supplier '{supplier_id or '?'}' not found. List ids via GET /api/turkey/suppliers.")
+    scores: dict[str, float] = {}
+    for aspect in _SUPPLIER_ASPECTS:
+        raw = payload.get(aspect, None)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(str(raw).replace(",", "."))
+        except Exception:
+            raise ValueError(f"Rating '{aspect}' must be a number between 1 and 5.")
+        if not 1 <= value <= 5:
+            raise ValueError(f"Rating '{aspect}' must be between 1 and 5 (got {value}).")
+        scores[aspect] = value
+    if not scores:
+        raise ValueError(f"Provide at least one of: {', '.join(_SUPPLIER_ASPECTS)} (each 1..5).")
+    rating = supplier.setdefault("rating", {"count": 0, "avg": None, "aspects": {}})
+    rating["count"] = int(rating.get("count", 0)) + 1
+    aspects = rating.setdefault("aspects", {})
+    for aspect, value in scores.items():
+        cell = aspects.setdefault(aspect, {"sum": 0.0, "n": 0})
+        cell["sum"] += value
+        cell["n"] += 1
+    aspect_avgs = [cell["sum"] / cell["n"] for cell in aspects.values() if cell.get("n")]
+    rating["avg"] = round(sum(aspect_avgs) / len(aspect_avgs), 2) if aspect_avgs else None
+    return {"ok": True, "supplierId": supplier["id"], "supplier": supplier["name"],
+            "rated": sorted(scores), "rating": {"count": rating["count"], "avg": rating["avg"],
+            "aspects": {k: round(v["sum"] / v["n"], 2) for k, v in aspects.items() if v.get("n")}}}
+
+
+def _supplier_offers_for_category(category_id: str, market: str, region_id: str | None) -> list[dict]:
+    offers = []
+    for s in TURKEY_SUPPLIERS:
+        if s["market"] != market:
+            continue
+        delivers_here = (not region_id) or (not s["deliveryZones"]) or (region_id in s["deliveryZones"])
+        for p in s["products"]:
+            if p["categoryId"] != category_id:
+                continue
+            offers.append({
+                "supplierId": s["id"], "supplier": s["name"], "regionId": s["regionId"],
+                "regionFa": s["regionFa"], "phone": s["phone"],
+                "product": p["name"], "unit": p["unit"], "priceTry": p["priceTry"],
+                "stock": p["stock"], "minOrder": p["minOrder"], "deliveryDays": p["deliveryDays"],
+                "ratingAvg": (s.get("rating") or {}).get("avg"),
+                "ratingCount": (s.get("rating") or {}).get("count", 0),
+                "deliversHere": delivers_here, "sample": s.get("sample", False),
+            })
+    offers.sort(key=lambda o: (o["priceTry"], o["deliveryDays"]))
+    return offers
+
+
+def _best_offer(offers: list[dict], only_in_zone: bool = True) -> dict | None:
+    """Cheapest offer, preferring a high-rated supplier when its price is within 8% of the cheapest."""
+    pool = [o for o in offers if o["deliversHere"]] if only_in_zone else list(offers)
+    if not pool and only_in_zone:
+        pool = list(offers)
+    if not pool:
+        return None
+    cheapest = min(o["priceTry"] for o in pool)
+    rated = [o for o in pool if (o["ratingAvg"] or 0) >= 4.5]
+    near = [o for o in rated if o["priceTry"] <= cheapest * 1.08]
+    if near:
+        return sorted(near, key=lambda o: (-(o["ratingAvg"] or 0), o["priceTry"]))[0]
+    return next(o for o in pool if o["priceTry"] == cheapest)
+
+
+def turkey_compare_prices(category_text: str, market: str = "restaurants", region: str | None = None) -> dict:
+    market = str(market or "restaurants").strip().lower() or "restaurants"
+    if market not in TURKEY_MARKETS:
+        raise ValueError(f"Unknown market '{market}'. Use one of: {', '.join(TURKEY_MARKETS)}")
+    category = turkey_match_category(str(category_text or ""), market)
+    if not category:
+        known = "، ".join(c["fa"].split(" (")[0] for c in TURKEY_MARKETS[market]["consumables"][:5])
+        raise ValueError(f"No product category matched '{str(category_text or '')[:40]}'. Try e.g.: {known} …")
+    region_id = None
+    if region:
+        region_id = turkey_match_region(str(region), market)
+        if not region_id:
+            raise ValueError(f"Unknown region '{str(region)[:40]}' for market '{market}'.")
+    offers = _supplier_offers_for_category(category["id"], market, region_id)
+    sample_present = any(o["sample"] for o in offers)
+    stats = None
+    recommendation = None
+    if offers:
+        prices = [o["priceTry"] for o in offers]
+        lowest, highest = min(prices), max(prices)
+        stats = {"min": lowest, "max": highest, "avg": round(sum(prices) / len(prices), 2),
+                 "spreadPct": round((highest - lowest) / lowest * 100, 1) if lowest else 0.0,
+                 "offerCount": len(offers), "inZoneCount": sum(1 for o in offers if o["deliversHere"])}
+        best = _best_offer(offers)
+        if best:
+            recommendation = {"supplierId": best["supplierId"], "supplier": best["supplier"],
+                              "priceTry": best["priceTry"], "unit": best["unit"],
+                              "reason": "قیمت مناسب در محدوده شما" if best["priceTry"] == stats["min"] and best["deliversHere"]
+                                        else ("امتیاز بالا (≥۴.۵) با قیمت نزدیک به ارزان‌ترین" if (best["ratingAvg"] or 0) >= 4.5
+                                              else "ارزان‌ترین پیشنهاد موجود")}
+    return {
+        "ok": True, "market": market,
+        "category": {"id": category["id"], "fa": category["fa"],
+                     "certNote": category.get("certNote")},
+        "regionId": region_id,
+        "offers": offers[:50],
+        "stats": stats,
+        "recommendation": recommendation,
+        "samplesNote": ("Some offers are from educational sample suppliers with fictional contacts. "
+                        "Disable with TURKEY_SEED_SAMPLE_SUPPLIERS=false.") if sample_present else None,
+        "message": "هیچ تأمین‌کننده‌ای برای این دسته ثبت نشده است. با POST /api/turkey/suppliers/register اضافه کنید." if not offers else None,
+        "disclaimer": "Prices are snapshots reported by suppliers; confirm before ordering.",
+    }
+
+
+def turkey_parse_needs_text(text: str, market: str = "restaurants") -> list[dict]:
+    """Parse free text like «مرغ 300، روغن 40 لیتر» into [{category, qty}] needs."""
+    needs: list[dict] = []
+    ascii_text = str(text or "").translate(DIGIT_TRANSLATION)
+    for chunk in re.split(r"[,،;؛\n]+", ascii_text)[:30]:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        category = turkey_match_category(chunk, market)
+        numbers = [float(n.replace(",", "")) for n in re.findall(r"\d+(?:[.,]\d+)?", chunk)]
+        qty = int(numbers[0]) if numbers else 0
+        if category and qty > 0:
+            needs.append({"category": category["id"], "qty": qty})
+    merged: dict[str, int] = {}
+    for n in needs:
+        merged[n["category"]] = merged.get(n["category"], 0) + n["qty"]
+    return [{"category": cid, "qty": q} for cid, q in merged.items()][:20]
+
+
+def turkey_smart_plan(payload: dict) -> dict:
+    market = str(payload.get("market") or "restaurants").strip().lower() or "restaurants"
+    if market not in TURKEY_MARKETS:
+        raise ValueError(f"Unknown market '{market}'. Use one of: {', '.join(TURKEY_MARKETS)}")
+    region = str(payload.get("region") or payload.get("regionId") or "").strip()
+    region_id = None
+    if region:
+        region_id = turkey_match_region(region, market)
+        if not region_id:
+            raise ValueError(f"Unknown region '{region[:40]}' for market '{market}'.")
+    needs: list[dict] = []
+    dropped: list[str] = []
+    warnings: list[str] = []
+    if isinstance(payload.get("needs"), list):
+        for raw in payload["needs"][:20]:
+            if not isinstance(raw, dict):
+                continue
+            label = str(raw.get("category") or raw.get("categoryId") or raw.get("name") or "")[:40]
+            category = turkey_match_category(label, market)
+            try:
+                qty = int(float(str(raw.get("qty", raw.get("quantity", 0))).replace(",", "")))
+            except Exception:
+                qty = 0
+            if category and qty > 0:
+                needs.append({"category": category["id"], "qty": qty})
+            elif label:
+                dropped.append(label)
+    text = str(payload.get("text") or "").strip()[:600]
+    if not needs and text:
+        needs = turkey_parse_needs_text(text, market)
+    if not needs:
+        raise ValueError("Provide needs like {\"needs\": [{\"category\": \"مرغ\", \"qty\": 200}]} or text: «مرغ 200، روغن 40».")
+    merged: dict[str, int] = {}
+    for n in needs:
+        merged[n["category"]] = merged.get(n["category"], 0) + n["qty"]
+
+    if dropped:
+        warnings.append("این اقلام شناسایی نشدند و از سبد کنار گذاشته شدند: " + "، ".join(dropped))
+    lines = []
+    grand_total = 0.0
+    baseline_total = 0.0
+    samples_used = False
+    for category_id, qty in merged.items():
+        category_fa = next((c["fa"] for c in TURKEY_MARKETS[market]["consumables"] if c["id"] == category_id), category_id)
+        offers = _supplier_offers_for_category(category_id, market, region_id)
+        in_zone = [o for o in offers if o["deliversHere"]]
+        pool = in_zone or offers
+        if not pool:
+            warnings.append(f"برای «{category_fa}» هیچ پیشنهادی ثبت نشده است.")
+            continue
+        avg_price = round(sum(o["priceTry"] for o in pool) / len(pool), 2)
+        baseline_total += avg_price * qty
+        best = _best_offer(pool, only_in_zone=False)  # pool is already zone-filtered
+        remaining = float(qty)
+        picks = []
+        ordered = ([best] + [o for o in pool if o is not best]) if best else pool
+        for offer in ordered:
+            if remaining <= 0:
+                break
+            if offer.get("stock") is not None and offer["stock"] <= 0:
+                continue
+            cap = float(offer["stock"]) if offer.get("stock") is not None else remaining
+            take = min(remaining, cap)
+            note = None
+            if take < offer["minOrder"]:
+                take = min(max(float(offer["minOrder"]), qty if remaining == qty else take), cap)
+                note = f"به حداقل سفارش {offer['minOrder']} {offer['unit']} افزایش یافت"
+            if take <= 0:
+                continue
+            line_total = round(take * offer["priceTry"], 2)
+            grand_total += line_total
+            samples_used = samples_used or offer.get("sample", False)
+            reason = ""
+            if offer is best and (offer["ratingAvg"] or 0) >= 4.5 and offer["priceTry"] > min(o["priceTry"] for o in pool):
+                reason = " · انتخاب به‌خاطر امتیاز بالا با قیمت نزدیک"
+            picks.append({"supplierId": offer["supplierId"], "supplier": offer["supplier"],
+                          "qty": int(take) if take == int(take) else take, "unit": offer["unit"],
+                          "priceTry": offer["priceTry"], "lineTotal": line_total,
+                          "deliveryDays": offer["deliveryDays"], "phone": offer["phone"],
+                          "note": note, "reason": reason.strip(" ·") or None})
+            remaining -= take
+        if remaining > 0.001:
+            warnings.append(f"موجودی اعلام‌شده برای «{category_fa}» کافی نیست؛ {int(remaining)} واحد تأمین نشد.")
+        lines.append({"categoryId": category_id, "categoryFa": category_fa, "requestedQty": qty,
+                      "avgMarketPrice": avg_price, "offersConsidered": len(pool),
+                      "inZoneOffers": len(in_zone), "picks": picks})
+    grand_total = round(grand_total, 2)
+    baseline_total = round(baseline_total, 2)
+    return {
+        "ok": True, "market": market, "regionId": region_id,
+        "lines": lines,
+        "totals": {"grandTotal": grand_total, "avgMarketTotal": baseline_total,
+                   "estimatedSavingsVsAvg": round(baseline_total - grand_total, 2)},
+        "warnings": warnings,
+        "samplesNote": ("Plan uses educational sample suppliers with fictional contacts; it shows the mechanics, "
+                        "not real quotes. Disable samples with TURKEY_SEED_SAMPLE_SUPPLIERS=false.") if samples_used else None,
+        "disclaimer": "This is a planning suggestion computed from supplier-reported prices, not a binding order.",
+    }
+
+
+_RESTAURANT_SAMPLE_SUPPLIERS = [
+    {"name": "عمده‌فروشی Anadolu Gıda", "region": "باغجیلار", "zones": [],
+     "products": [{"categoryId": "chicken", "name": "مرغ کامل منجمد", "unit": "کیلوگرم", "priceTry": 128, "stock": 4000, "minOrder": 100, "deliveryDays": 1},
+                  {"categoryId": "frying-oil", "name": "روغن آفتابگردان ۱۸ لیتری", "unit": "لیتر", "priceTry": 58, "stock": 8000, "minOrder": 200, "deliveryDays": 1},
+                  {"categoryId": "rice", "name": "برنج بالدو ترک", "unit": "کیلوگرم", "priceTry": 46, "stock": 6000, "minOrder": 250, "deliveryDays": 2}]},
+    {"name": "تدارکات Marmara Et", "region": "اسنلر", "zones": ["bagcilar", "esenler", "kucukcekmece", "esenyurt"],
+     "products": [{"categoryId": "beef", "name": "گوشت گوساله بی‌استخوان", "unit": "کیلوگرم", "priceTry": 289, "stock": 2500, "minOrder": 50, "deliveryDays": 1},
+                  {"categoryId": "chicken", "name": "مرغ تازه تک‌تکه", "unit": "کیلوگرم", "priceTry": 134, "stock": 3000, "minOrder": 150, "deliveryDays": 1}]},
+    {"name": "سبزیدار Boğaz Sebze", "region": "گونگورن", "zones": [],
+     "products": [{"categoryId": "vegetables", "name": "سبد سبزیجات و صیفی رستورانی", "unit": "کیلوگرم", "priceTry": 32, "stock": 5000, "minOrder": 100, "deliveryDays": 0},
+                  {"categoryId": "dairy", "name": "پنیر سفید رستورانی", "unit": "کیلوگرم", "priceTry": 118, "stock": 1200, "minOrder": 40, "deliveryDays": 1}]},
+    {"name": "توزیع Ege Unlu", "region": "کوچوک‌چکمجه", "zones": [],
+     "products": [{"categoryId": "flour-bakery", "name": "آرد نانوایی نوع ۱", "unit": "کیلوگرم", "priceTry": 24, "stock": 10000, "minOrder": 300, "deliveryDays": 2},
+                  {"categoryId": "packaging", "name": "ظرف بیرون‌بر کرافت", "unit": "عدد", "priceTry": 2.1, "stock": 200000, "minOrder": 5000, "deliveryDays": 2}]},
+    {"name": "لبنیات Karadeniz Süt", "region": "اسنیورت", "zones": [],
+     "products": [{"categoryId": "dairy", "name": "ماست صبحانه ده‌کیلویی", "unit": "کیلوگرم", "priceTry": 112, "stock": 2000, "minOrder": 50, "deliveryDays": 1},
+                  {"categoryId": "beverages", "name": "آب معدنی ۱.۵ لیتری", "unit": "عدد", "priceTry": 9, "stock": 20000, "minOrder": 500, "deliveryDays": 1}]},
+    {"name": "عمده Hünkar Baharat", "region": "عمرانیه", "zones": ["umraniye", "pendik", "kartal", "sultanbeyli"],
+     "products": [{"categoryId": "legumes-spices", "name": "عدس و لوبیا فله", "unit": "کیلوگرم", "priceTry": 68, "stock": 1500, "minOrder": 25, "deliveryDays": 2},
+                  {"categoryId": "rice", "name": "برنج اوسمانجیک", "unit": "کیلوگرم", "priceTry": 49, "stock": 4000, "minOrder": 200, "deliveryDays": 2}]},
+    {"name": "تازه‌رسان Pera Tavukçuluk", "region": "پندیک", "zones": [],
+     "products": [{"categoryId": "chicken", "name": "مرغ تازه روزانه", "unit": "کیلوگرم", "priceTry": 142, "stock": 2000, "minOrder": 80, "deliveryDays": 0}]},
+    {"name": "روغن‌پخش Tarihi Yağ", "region": "کارتال", "zones": [],
+     "products": [{"categoryId": "frying-oil", "name": "روغن سرخ‌کردنی حرفه‌ای", "unit": "لیتر", "priceTry": 61, "stock": 6000, "minOrder": 150, "deliveryDays": 2},
+                  {"categoryId": "beverages", "name": "نوشابه قوطی ۲۴ تایی", "unit": "عدد", "priceTry": 11, "stock": 15000, "minOrder": 480, "deliveryDays": 2}]},
+    {"name": "قصابی Şehzade Kasap", "region": "سلطان‌بیلی", "zones": ["sultanbeyli", "umraniye", "kartal", "pendik"],
+     "products": [{"categoryId": "beef", "name": "گوشت گوسفندی تازه", "unit": "کیلوگرم", "priceTry": 315, "stock": 1800, "minOrder": 40, "deliveryDays": 1}]},
+    {"name": "بسته‌بان İstanbul Paket", "region": "غازی‌عثمان‌پاشا", "zones": [],
+     "products": [{"categoryId": "packaging", "name": "جعبه پیتزا و پک سلفونی", "unit": "عدد", "priceTry": 1.9, "stock": 150000, "minOrder": 3000, "deliveryDays": 3}]},
+    {"name": "پخش Dostlar Gıda", "region": "باغجیلار", "zones": [],
+     "products": [{"categoryId": "rice", "name": "برنج ایرانی دم‌سیاه", "unit": "کیلوگرم", "priceTry": 52, "stock": 3500, "minOrder": 150, "deliveryDays": 2},
+                  {"categoryId": "frying-oil", "name": "روغن مایع کم‌اشباع", "unit": "لیتر", "priceTry": 64, "stock": 4000, "minOrder": 100, "deliveryDays": 2},
+                  {"categoryId": "legumes-spices", "name": "ادویه ترکیبی رستورانی", "unit": "کیلوگرم", "priceTry": 74, "stock": 1200, "minOrder": 30, "deliveryDays": 2}]},
+    {"name": "سبزه‌فروش Yıldız Meyve", "region": "اسنلر", "zones": [],
+     "products": [{"categoryId": "vegetables", "name": "گوجه، خیار و سبزی روزانه", "unit": "کیلوگرم", "priceTry": 35, "stock": 4000, "minOrder": 120, "deliveryDays": 0}]},
+    {"name": "نان‌ساز Saray Un", "region": "گونگورن", "zones": [],
+     "products": [{"categoryId": "flour-bakery", "name": "آرد سوپر لوکس پیتزا", "unit": "کیلوگرم", "priceTry": 26, "stock": 9000, "minOrder": 250, "deliveryDays": 2}]},
+    {"name": "گوشت‌بر Kervan Et", "region": "کوچوک‌چکمجه", "zones": [],
+     "products": [{"categoryId": "beef", "name": "دنباله و سردست گوساله", "unit": "کیلوگرم", "priceTry": 342, "stock": 1500, "minOrder": 60, "deliveryDays": 1},
+                  {"categoryId": "chicken", "name": "فیله مرغ", "unit": "کیلوگرم", "priceTry": 149, "stock": 2500, "minOrder": 200, "deliveryDays": 1}]},
+    {"name": "لبنی‌سان Lezzet Süt", "region": "اسنیورت", "zones": [],
+     "products": [{"categoryId": "dairy", "name": "کره و خامه رستورانی", "unit": "کیلوگرم", "priceTry": 125, "stock": 1500, "minOrder": 60, "deliveryDays": 1},
+                  {"categoryId": "vegetables", "name": "سیب‌زمینی و پیاز مصرفی", "unit": "کیلوگرم", "priceTry": 38, "stock": 2500, "minOrder": 150, "deliveryDays": 1}]},
+]
+
+
+def _turkey_restaurant_sample_suppliers() -> list[dict]:
+    suppliers = []
+    for i, item in enumerate(_RESTAURANT_SAMPLE_SUPPLIERS):
+        seed = f"sample-supplier-{i}"
+        raw = {
+            "name": item["name"], "region": item["region"], "deliveryZones": item["zones"],
+            "phone": "+90 53" + str(_sample_det(seed + "-t1", 0, 9)) + " " +
+                     f"{_sample_det(seed + '-t2', 100, 999)} {_sample_det(seed + '-t3', 1000, 9999)}",
+            "products": item["products"],
+            "source": "seed-sample", "sample": True,
+        }
+        supplier = normalize_turkey_supplier(raw, "restaurants")
+        if supplier:
+            suppliers.append(supplier)
+    return suppliers
+
+
+def turkey_seed_sample_suppliers() -> dict:
+    generated = _turkey_restaurant_sample_suppliers()
+    existing = {s["id"] for s in TURKEY_SUPPLIERS}
+    fresh = [s for s in generated if s["id"] not in existing]
+    TURKEY_SUPPLIERS.extend(fresh)
+    return {"ok": True, "imported": len(fresh), "skippedDuplicates": len(generated) - len(fresh),
+            "total": sum(1 for s in TURKEY_SUPPLIERS if s["market"] == "restaurants"),
+            "note": "Educational sample suppliers (sample:true) with fictional contacts."}
+
+
+if env_flag("TURKEY_SEED_SAMPLE_SUPPLIERS", True):
+    try:
+        turkey_seed_sample_suppliers()
+    except Exception:
+        pass  # sample seeding must never block startup
 
 
 def search_vendors(payload: dict):
@@ -3080,6 +4643,37 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json_response(international_exhibition_sources())
         if path == "/api/send-log":
             return self.json_response({"ok": True, "items": list(SEND_LOG)})
+        if path == "/api/bale/webhook-info":
+            try:
+                status, data = bale_api("getWebhookInfo", {}, timeout=15)
+                return self.json_response({"ok": status < 400, "providerStatus": status, "response": data,
+                                           **bale_bot_state_summary(), "webhookSecretConfigured": bool(BALE_WEBHOOK_SECRET)})
+            except Exception as exc:
+                return self.json_response({"ok": False, "error": str(exc)}, 400)
+        if path == "/api/bale/inbox":
+            return self.json_response({"ok": True, "items": list(BALE_INBOX), **bale_bot_state_summary()})
+        if path == "/api/turkey/opportunities":
+            market = parse_qs(urlparse(self.path).query).get("market", ["clinics"])[0].strip().lower() or "clinics"
+            try:
+                return self.json_response(turkey_opportunities(market))
+            except ValueError as exc:
+                return self.json_response({"ok": False, "error": str(exc)}, 400)
+        if path == "/api/turkey/suppliers":
+            query = parse_qs(urlparse(self.path).query)
+            market = query.get("market", ["restaurants"])[0].strip().lower() or "restaurants"
+            try:
+                return self.json_response(turkey_suppliers_list(market))
+            except ValueError as exc:
+                return self.json_response({"ok": False, "error": str(exc)}, 400)
+        if path == "/api/turkey/compare":
+            query = parse_qs(urlparse(self.path).query)
+            category = query.get("category", query.get("q", [""]))[0]
+            market = query.get("market", ["restaurants"])[0].strip().lower() or "restaurants"
+            region = (query.get("region", [""])[0] or "").strip() or None
+            try:
+                return self.json_response(turkey_compare_prices(category, market, region))
+            except ValueError as exc:
+                return self.json_response({"ok": False, "error": str(exc)}, 400)
         if path == "/api/leads":
             try:
                 return self.json_response(fetch_leads_database(int(parse_qs(urlparse(self.path).query).get("limit", ["100"])[0])))
@@ -3117,11 +4711,11 @@ class Handler(SimpleHTTPRequestHandler):
         if auth_error:
             status, message = auth_error
             return self.json_response({"ok": False, "error": message}, status)
-        if path not in {"/api/audit", "/api/ai-seo-review", "/api/analyze-clinic-candidates", "/api/send", "/api/vendor-search", "/api/clinic-search", "/api/import-search-html", "/api/enrich-clinics", "/api/scrape-directory", "/api/contact-enrich", "/api/video/script", "/api/video/render", "/api/video/status", "/api/exhibition/import", "/api/exhibition/seed-candidates", "/api/exhibition/enrich", "/api/exhibition/search-html", "/api/exhibition/ai-validate", "/api/leads/bulk", "/api/export-clinics", "/api/generate-article", "/api/proposal-pdf", "/api/proposal-link"}:
+        if path not in {"/api/audit", "/api/ai-seo-review", "/api/analyze-clinic-candidates", "/api/send", "/api/vendor-search", "/api/clinic-search", "/api/import-search-html", "/api/enrich-clinics", "/api/scrape-directory", "/api/contact-enrich", "/api/video/script", "/api/video/render", "/api/video/status", "/api/exhibition/import", "/api/exhibition/seed-candidates", "/api/exhibition/enrich", "/api/exhibition/search-html", "/api/exhibition/ai-validate", "/api/leads/bulk", "/api/export-clinics", "/api/generate-article", "/api/proposal-pdf", "/api/proposal-link", "/api/bale/webhook", "/api/bale/webhook-setup", "/api/bale/webhook-delete", "/api/turkey/bids/import", "/api/turkey/bids/sync", "/api/turkey/bids/seed-samples", "/api/turkey/suppliers/register", "/api/turkey/suppliers/rate", "/api/turkey/smart-plan"}:
             return self.json_response({"ok": False, "error": "Not found"}, 404)
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            request_limit = 2_000_000 if path in {"/api/proposal-pdf", "/api/proposal-link", "/api/send", "/api/import-search-html", "/api/enrich-clinics", "/api/exhibition/import", "/api/exhibition/enrich", "/api/leads/bulk", "/api/export-clinics", "/api/analyze-clinic-candidates"} else 30_000
+            request_limit = 100_000 if path == "/api/bale/webhook" else 2_000_000 if path in {"/api/proposal-pdf", "/api/proposal-link", "/api/send", "/api/import-search-html", "/api/enrich-clinics", "/api/exhibition/import", "/api/exhibition/enrich", "/api/leads/bulk", "/api/export-clinics", "/api/analyze-clinic-candidates", "/api/turkey/bids/import", "/api/turkey/suppliers/register"} else 30_000
             if length <= 0 or length > request_limit:
                 raise ValueError("Invalid request size")
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -3189,6 +4783,33 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.json_response(persist_leads_database(items))
             if path == "/api/generate-article":
                 return self.json_response(generate_seo_article(payload))
+            if path == "/api/bale/webhook":
+                if not bale_bot_enabled():
+                    return self.json_response({"ok": False, "error": "Bale bot is disabled (BALE_BOT_MODE=off)."}, 503)
+                if not bale_webhook_secret_ok(self.path, self.headers):
+                    return self.json_response({"ok": False, "error": "Invalid Bale webhook secret."}, 401)
+                return self.json_response(bale_process_update(payload))
+            if path == "/api/bale/webhook-setup":
+                base = str(payload.get("url", "")).strip() or self.public_base_url()
+                status, data = bale_set_webhook(base)
+                return self.json_response({"ok": status < 400, "providerStatus": status, "response": data,
+                                           "webhookUrl": f"{base.rstrip('/')}/api/bale/webhook",
+                                           "webhookSecretConfigured": bool(BALE_WEBHOOK_SECRET)})
+            if path == "/api/bale/webhook-delete":
+                status, data = bale_api("deleteWebhook", {"drop_pending_updates": False}, timeout=15)
+                return self.json_response({"ok": status < 400, "providerStatus": status, "response": data})
+            if path == "/api/turkey/bids/import":
+                return self.json_response(turkey_bids_import(payload))
+            if path == "/api/turkey/bids/sync":
+                return self.json_response(turkey_bids_sync())
+            if path == "/api/turkey/bids/seed-samples":
+                return self.json_response(turkey_seed_sample_bids(int(payload.get("count", 100) or 100)))
+            if path == "/api/turkey/suppliers/register":
+                return self.json_response(turkey_suppliers_register(payload))
+            if path == "/api/turkey/suppliers/rate":
+                return self.json_response(turkey_supplier_rate(payload))
+            if path == "/api/turkey/smart-plan":
+                return self.json_response(turkey_smart_plan(payload))
             url = str(payload.get("url", "")).strip()
             if not url:
                 raise ValueError("URL is required")
@@ -3214,6 +4835,8 @@ class Handler(SimpleHTTPRequestHandler):
                      "Exhibition AI validation" if path == "/api/exhibition/ai-validate" else
                      "Lead database" if path == "/api/leads/bulk" else
                      "Article generation" if path == "/api/generate-article" else
+                     "Bale bot" if path.startswith("/api/bale/") else
+                     "Turkey procurement" if path.startswith("/api/turkey/") else
                      "Proposal PDF" if path in {"/api/proposal-pdf", "/api/proposal-link"} else "Audit")
             return self.json_response({"ok": False, "error": f"{label} failed: {type(exc).__name__}: {exc}"}, 500)
 
@@ -3223,6 +4846,9 @@ def main():
     port = int(os.getenv("PORT", "8000"))
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Clinic Signal running at http://{host}:{port}")
+    if BALE_BOT_MODE == "polling" and not os.getenv("BALE_BOT_TOKEN", "").strip():
+        print("[bale-bot] BALE_BOT_MODE=polling but BALE_BOT_TOKEN is missing; polling disabled")
+    start_bale_polling_if_enabled()
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()

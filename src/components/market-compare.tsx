@@ -89,7 +89,9 @@ export function MarketCompare() {
   }, []);
 
   useEffect(() => {
-    load();
+    void (async () => {
+      await load();
+    })();
   }, [load]);
 
   const scan = async (kw?: string) => {
