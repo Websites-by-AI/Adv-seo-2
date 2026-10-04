@@ -4,6 +4,10 @@
   "compatibility_date": "2026-07-17",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
+  // Custom domain: https://turkey.exhibition2world.ir (zone is active on this account)
+  "routes": [
+    { "pattern": "turkey.exhibition2world.ir", "custom_domain": true }
+  ],
   "main": ".open-next/worker.js",
   "assets": {
     "directory": ".open-next/assets",
