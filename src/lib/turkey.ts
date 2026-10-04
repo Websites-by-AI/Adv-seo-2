@@ -163,7 +163,7 @@ const RESTAURANT_NAMES = ["Anadolu", "Boğaz", "Hünkar", "Lezzet", "Saray", "Ma
 const RESTAURANT_SUFFIXES = ["Sofrası", "Lokantası", "Kebap Evi", "Restoranı", "Ocakbaşı", "Pide Evi"];
 const BASE_EPOCH = Date.UTC(2026, 7, 8);
 
-export function makeSampleBids(count = 10): Bid[] {
+export function makeSampleBids(count = 100): Bid[] {
   const bids: Bid[] = [];
   const n = Math.max(1, Math.min(count, 500));
   for (let i = 0; i < n; i++) {
@@ -306,7 +306,7 @@ export function opportunities(marketParam: string) {
   const markets: MarketId[] = marketParam === "all"
     ? (Object.keys(MARKETS) as MarketId[])
     : marketParam in MARKETS ? [marketParam as MarketId] : (() => { throw new Error(`Unknown market '${marketParam}'. Use one of: clinics, restaurants or 'all'`); })();
-  const bids = makeSampleBids(10).map(scoredBid);
+  const bids = makeSampleBids(100).map(scoredBid);
   const consumables = markets.flatMap((m) => MARKETS[m].consumables.map((c) => {
     const marginMid = (c.margin[0] + c.margin[1]) / 2;
     return { ...c, score: Math.round(c.consumption * marginMid * 10) / 10, activeBids: bids.filter((b) => b.categoryId === c.id).length };
